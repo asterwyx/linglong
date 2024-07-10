@@ -2,8 +2,15 @@
 include /usr/share/dpkg/pkg-info.mk
 
 OS=$(shell awk '/^NAME=/' /etc/os-release | sed 's/NAME=//' | sed 's/\"//g' | tr '[:upper:]' '[:lower:]')
-ARCH=$(shell dpkg-architecture -qDEB_HOST_ARCH | cut -c1-3)
+ARCH=$(shell dpkg-architecture -qDEB_TARGET_GNU_TYPE)
 VERSION=$(shell awk '/VERSION=/' /etc/os-release | sed 's/VERSION=//' | sed 's/\"//g' | sed 's/[.]0/./')
+ENABLE_UAB_SUPPORT=FALSE
+
+ifeq ($(OS) $(VERSION), deepin 23)
+	ENABLE_UAB_SUPPORT=TRUE
+else ifeq ($(OS) $(VERSION), uos 20)
+	ENABLE_UAB_SUPPORT=TRUE
+endif
 
 %:
 	dh $@ --buildsystem=cmake
@@ -14,14 +21,15 @@ override_dh_auto_install:
 
 EXTRA_OPTION = -DCPM_LOCAL_PACKAGES_ONLY=ON -DLINGLONG_VERSION=$(DEB_VERSION_UPSTREAM)
 
-ifeq ($(OS) $(VERSION), deepin 23)
-	EXTRA_OPTION += -DENABLE_UAB=ON
+ifeq ($(ENABLE_UAB_SUPPORT), TRUE)
+
+	EXTRA_OPTION += -DENABLE_UAB=ON -DSTATIC_BOX=ON
 
 override_dh_auto_install:
 	dh_auto_install
 
-	install -d debian/linglong-builder/usr/share/linglong/builder/uab
-	dh_install -p linglong-builder usr/share/linglong/builder/uab/ usr/share/linglong/builder/
+	install -d debian/linglong-builder/usr/lib/$(ARCH)/linglong/builder/uab
+	dh_install -p linglong-builder usr/lib/$(ARCH)/linglong/builder/uab/ usr/lib/$(ARCH)/linglong/builder/
 endif
 
 override_dh_auto_configure:
