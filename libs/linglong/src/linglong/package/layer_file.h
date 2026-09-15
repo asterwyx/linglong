@@ -4,18 +4,22 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_PACKAGE_LAYER_FILE_H_
-#define LINGLONG_PACKAGE_LAYER_FILE_H_
+#pragma once
 
 #include "linglong/api/types/v1/LayerInfo.hpp"
 #include "linglong/utils/error/error.h"
 
 #include <QFile>
+#include <QSharedPointer>
 
 namespace linglong::package {
 
-const QByteArray magicNumber =
-  QByteArray("<<< deepin linglong layer archive >>>").leftJustified(40, 0);
+inline const QByteArray &magicNumber()
+{
+    static auto magicNumber =
+      QByteArray("<<< deepin linglong layer archive >>>").leftJustified(40, 0);
+    return magicNumber;
+}
 
 // LayerFile format:
 //
@@ -42,10 +46,11 @@ public:
     // NOTE: Maybe should be removed. and use QTemporaryFile
     void setCleanStatus(bool status) noexcept;
 
+    static utils::error::Result<QSharedPointer<LayerFile>> New(int fd) noexcept;
     static utils::error::Result<QSharedPointer<LayerFile>> New(const QString &path) noexcept;
 
 private:
-    explicit LayerFile(const QString &path);
+    LayerFile() = default;
     utils::error::Result<quint32> metaInfoLength();
 
     bool cleanup = false;
@@ -53,5 +58,3 @@ private:
 };
 
 } // namespace linglong::package
-
-#endif /* LINGLONG_PACKAGE_LAYER_FILE_H_ */

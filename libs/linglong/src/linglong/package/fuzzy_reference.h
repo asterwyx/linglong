@@ -3,12 +3,9 @@
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
-
-#ifndef LINGLONG_PACKAGE_FUZZY_REFERENCE_H_
-#define LINGLONG_PACKAGE_FUZZY_REFERENCE_H_
+#pragma once
 
 #include "linglong/package/architecture.h"
-#include "linglong/package/version.h"
 
 #include <QString>
 
@@ -20,27 +17,25 @@ namespace linglong::package {
 class FuzzyReference final
 {
 public:
-    static utils::error::Result<FuzzyReference> parse(const QString &raw) noexcept;
+    static utils::error::Result<FuzzyReference> parse(const std::string &raw) noexcept;
     static utils::error::Result<FuzzyReference>
-    create(const std::optional<QString> &channel,
-           const QString &id,
-           const std::optional<Version> &version,
+    create(const std::optional<std::string> &channel,
+           const std::string &id,
+           const std::optional<std::string> &version,
            const std::optional<Architecture> &arch) noexcept;
 
-    std::optional<QString> channel;
-    QString id;
-    std::optional<Version> version;
+    std::optional<std::string> channel;
+    std::string id;
+    std::optional<std::string> version;
     std::optional<Architecture> arch;
 
-    QString toString() const noexcept;
+    [[nodiscard]] std::string toString() const noexcept;
 
 private:
-    explicit FuzzyReference(const std::optional<QString> &channel,
-                            const QString &id,
-                            const std::optional<Version> &version,
+    explicit FuzzyReference(const std::optional<std::string> &channel,
+                            const std::string &id,
+                            const std::optional<std::string> &version,
                             const std::optional<Architecture> &arch);
 };
 
 } // namespace linglong::package
-
-#endif

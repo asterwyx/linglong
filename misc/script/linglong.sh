@@ -1,24 +1,16 @@
-# SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+#!/usr/bin/env sh
+
+# SPDX-FileCopyrightText: 2023-2025 UnionTech Software Technology Co., Ltd.
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
-# XDG_DATA_DIRS environment variable maybe be unset by a program
-# so we need to set it again
+# shellcheck shell=sh
 
-LINGLONG_ROOT="/var/lib/linglong"
+# Profile.d script for linglong/linyaps
+# This script sources the XDG_DATA_DIRS generation script and exports
+# the modified XDG_DATA_DIRS environment variable for user sessions.
 
-new_dirs=
-while read -r install_path; do
-    share_path=$install_path/entries/share
-    case ":$XDG_DATA_DIRS:" in
-    *":$share_path:"*) : ;;
-    *":$share_path/:"*) : ;;
-    *) new_dirs=${new_dirs:+${new_dirs}:}$share_path ;;
-    esac
-done <<EOF
-	${XDG_DATA_HOME:-"$HOME/.local/share"}/linglong
-	${LINGLONG_ROOT}
-EOF
+source_script="@CMAKE_INSTALL_PREFIX@/lib/linglong/generate-xdg-data-dirs.sh"
 
-XDG_DATA_DIRS="${new_dirs:+${new_dirs}:}${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-export XDG_DATA_DIRS="$XDG_DATA_DIRS"
+# Source the script and export XDG_DATA_DIRS if successful
+[ -r "${source_script}" ] && . "${source_script}" && [ -n "${XDG_DATA_DIRS}" ] && export XDG_DATA_DIRS

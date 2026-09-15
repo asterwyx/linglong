@@ -1,36 +1,49 @@
-// SPDX-FileCopyrightText: 2024 UnionTech Software Technology Co., Ltd.
+// SPDX-FileCopyrightText: 2024 - 2026 UnionTech Software Technology Co., Ltd.
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include "linglong/api/types/v1/Generators.hpp"
+#include "light_elf.h"
+#include "linglong/api/types/v1/Generators.hpp" // IWYU pragma: keep
 #include "linglong/api/types/v1/UabMetaInfo.hpp"
+#include "linglong/common/uab_signature.h"
+#include "linglong/utils/sha256.h"
 
 #include <gelf.h>
 #include <getopt.h>
-#include <libelf.h>
-#include <linux/limits.h>
 #include <nlohmann/json.hpp>
-#include <openssl/evp.h>
 #include <sys/mount.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
-#include <optional>
+#include <string>
+#include <string_view>
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern "C" int erofsfuse_main(int argc, char **argv);
 
-static std::atomic_bool mountFlag{ false };
-static std::atomic_bool createFlag{ false };
-static std::string mountPoint{};
+// Stable ELF ABI for signing tools. The linker renames this executable input section to
+// .note.uab.sig. Its descriptor stores the 64-byte SHA-256 digest of linglong.meta.
+__attribute__((used, section(".text.uab.sig"), aligned(4))) const auto linglongUabSignature =
+  linglong::common::uab::signatureNote;
+
+namespace {
+
+std::atomic_bool mountFlag{ false };  // NOLINT
+std::atomic_bool createFlag{ false }; // NOLINT
+std::filesystem::path mountPoint;     // NOLINT
+constexpr std::size_t default_page_size = 4096;
 
 constexpr auto usage = u8R"(Linglong Universal Application Bundle
 
@@ -41,25 +54,28 @@ uabBundle [uabOptions...] [-- loaderOptions...]
 
 Options:
     --extract=PATH extract the read-only filesystem image which is in the 'linglong.bundle' segment of uab to PATH. [exclusive]
+    --mount=PATH mount the read-only filesystem image which is in the 'linglong.bundle' segment of uab to PATH, use ctrl+c to stop. [exclusive]
     --print-meta print content of json which from the 'linglong.meta' segment of uab to STDOUT [exclusive]
     --help print usage of uab [exclusive]
 )";
 
-template<typename Func>
-struct defer
-{
-    explicit defer(Func newF)
-        : f(std::move(newF))
-    {
-    }
-
-    ~defer() { f(); }
-
-private:
-    Func f;
+enum uabOption : std::uint8_t {
+    Help = 1,
+    Extract,
+    Mount,
+    Meta,
 };
 
-std::string resolveRealPath(std::string_view source) noexcept
+struct argOption
+{
+    bool help{ false };
+    bool printMeta{ false };
+    std::string extractPath;
+    std::string mountPath;
+    std::vector<std::string_view> loaderArgs;
+};
+
+std::string resolveRealPath(const std::string &source) noexcept
 {
     std::array<char, PATH_MAX + 1> resolvedPath{};
 
@@ -72,294 +88,262 @@ std::string resolveRealPath(std::string_view source) noexcept
     return { ptr };
 }
 
-std::string detectLinglong() noexcept
+std::size_t getChunkSize(std::size_t bundleSize) noexcept
 {
-    auto *pathPtr = ::getenv("PATH");
-    if (pathPtr == nullptr) {
-        std::cerr << "failed to get PATH" << std::endl;
-        return {};
+    std::size_t page_size{ default_page_size };
+    const auto ret = sysconf(_SC_PAGESIZE);
+    if (ret > 0) {
+        page_size = ret;
     }
 
-    struct stat sb
-    {
-    };
-
-    std::string path{ pathPtr };
-    std::string cliPath;
-    size_t startPos = 0;
-    size_t endPos = 0;
-
-    while ((endPos = path.find(':', startPos)) != std::string::npos) {
-        std::string binPath = path.substr(startPos, endPos - startPos) + "/ll-cli";
-        if ((::stat(binPath.c_str(), &sb) == 0) && ((sb.st_mode & S_IXOTH) != 0U)) {
-            cliPath = binPath;
-            break;
-        }
-
-        startPos = endPos + 1;
+    std::size_t block_size{ 0 };
+    struct statvfs fs_info{};
+    if (statvfs(".", &fs_info) > 0) {
+        block_size = fs_info.f_bsize;
     }
 
-    return cliPath;
-}
-
-int importSelf(std::string_view cliBin, std::string_view appRef, std::string_view uab) noexcept
-{
-    std::array<int, 2> out{};
-    if (pipe(out.data()) == -1) {
-        std::cerr << "pipe() failed:" << ::strerror(errno) << std::endl;
-        return -1;
+    const auto base_block = std::max(page_size, block_size);
+    if (bundleSize <= static_cast<std::size_t>(10 * 1024 * 1024)) {
+        return 64 * base_block;
     }
 
-    auto pid = fork();
-    if (pid < 0) {
-        std::cerr << "fork() failed:" << ::strerror(errno) << std::endl;
-        return -1;
+    if (bundleSize <= static_cast<std::size_t>(100 * 1024 * 1024)) {
+        return 128 * base_block;
     }
 
-    if (pid == 0) {
-        ::close(out[0]);
-        if (::dup2(out[1], STDOUT_FILENO) == -1) {
-            std::cerr << "dup2() failed in sub-process:" << ::strerror(errno) << std::endl;
-            return -1;
-        }
-
-        return ::execl(cliBin.data(), cliBin.data(), "--json", "list", nullptr);
-    }
-
-    ::close(out[1]);
-    auto closeReadPipe = defer([fd = out[0]] {
-        ::close(fd);
-    });
-
-    std::array<char, PIPE_BUF> buf{};
-    std::string content;
-    auto bytesRead{ -1 };
-    while ((bytesRead = ::read(out[0], buf.data(), buf.size())) != 0) {
-        if (bytesRead == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            std::cerr << "read failed:" << ::strerror(errno) << std::endl;
-            return -1;
-        }
-
-        content.append(buf.data(), bytesRead);
-    }
-
-    int status{ 0 };
-    auto ret = ::waitpid(pid, &status, 0);
-    if (ret == -1) {
-        std::cerr << "waitpid() failed:" << ::strerror(errno) << std::endl;
-        return -1;
-    }
-
-    if (auto result = WEXITSTATUS(status); result != 0) {
-        std::cerr << "ll-cli --json list failed, return code:" << result << std::endl;
-        return -1;
-    }
-
-    std::vector<linglong::api::types::v1::PackageInfoV2> packages;
-    try {
-        auto packagesJson = nlohmann::json::parse(content);
-        packages = packagesJson.get<decltype(packages)>();
-    } catch (nlohmann::detail::parse_error &e) {
-        std::cerr << "parse content from ll-cli list output error:" << e.what() << std::endl;
-        return -1;
-    } catch (std::exception &e) {
-        std::cerr << "catching an exception when parsing output of ll-cli list:" << e.what()
-                  << std::endl;
-        return -1;
-    } catch (...) {
-        std::cerr << "catching unknown value" << std::endl;
-        return -1;
-    }
-
-    for (const auto &package : packages) {
-        auto curRef =
-          package.channel + ":" + package.id + "/" + package.version + "/" + package.arch[0];
-        if (curRef == appRef) {
-            return 0; // already exist
-        }
-    }
-
-    // install a new application
-    pid = fork();
-    if (pid < 0) {
-        std::cerr << "fork() failed:" << ::strerror(errno) << std::endl;
-        return -1;
-    }
-
-    if (pid == 0) {
-        return ::execl(cliBin.data(), cliBin.data(), "install", uab, nullptr);
-    }
-
-    status = -1;
-    ret = ::waitpid(pid, &status, 0);
-    if (ret == -1) {
-        std::cerr << "waitpid() failed:" << ::strerror(errno) << std::endl;
-        return -1;
-    }
-
-    if (auto result = WEXITSTATUS(status); result != 0) {
-        std::cerr << "ll-cli install failed, return code:" << result << std::endl;
-        return -1;
-    }
-
-    return 0;
-}
-
-std::optional<GElf_Shdr> getSectionHeader(int elfFd, std::string_view sectionName) noexcept
-{
-    std::error_code ec;
-    std::optional<GElf_Shdr> secHdr;
-
-    auto elfPath = std::filesystem::read_symlink(std::filesystem::path{ "/proc/self/fd" }
-                                                   / std::to_string(elfFd),
-                                                 ec);
-    if (ec) {
-        std::cerr << "failed to get binary path:" << ec.message() << std::endl;
-        return std::nullopt;
-    }
-
-    auto *elf = elf_begin(elfFd, ELF_C_READ, nullptr);
-    if (elf == nullptr) {
-        std::cerr << elfPath << " not usable:" << elf_errmsg(errno) << std::endl;
-        return std::nullopt;
-    }
-
-    auto closeElf = defer([elf] {
-        elf_end(elf);
-    });
-
-    size_t shdrstrndx{ 0 };
-    if (elf_getshdrstrndx(elf, &shdrstrndx) == -1) {
-        std::cerr << "failed to get section header index of bundle " << elfPath << ":"
-                  << elf_errmsg(errno) << std::endl;
-        return std::nullopt;
-    }
-
-    Elf_Scn *scn = nullptr;
-    while ((scn = elf_nextscn(elf, scn)) != nullptr) {
-        GElf_Shdr shdr;
-        if (gelf_getshdr(scn, &shdr) == nullptr) {
-            std::cerr << "failed to get section header of bundle " << elfPath << ":"
-                      << elf_errmsg(errno) << std::endl;
-            break;
-        }
-
-        std::string_view sname = elf_strptr(elf, shdrstrndx, shdr.sh_name);
-        if (sname == sectionName) {
-            secHdr = shdr;
-            break;
-        }
-    }
-
-    return secHdr;
+    return 256 * base_block;
 }
 
 std::string calculateDigest(int fd, std::size_t bundleOffset, std::size_t bundleLength) noexcept
 {
-    auto file = ::dup(fd);
-    if (file == -1) {
-        std::cerr << "dup() error:" << ::strerror(errno) << std::endl;
-        return {};
-    }
+    digest::SHA256 sha256;
+    std::array<std::byte, 32> digest{};
+    auto *mem = mmap(nullptr, bundleLength, PROT_READ, MAP_PRIVATE, fd, bundleOffset);
+    if (mem != MAP_FAILED) {
+        posix_madvise(mem, bundleLength, POSIX_FADV_WILLNEED | POSIX_FADV_SEQUENTIAL);
+        sha256.update(reinterpret_cast<std::byte *>(mem), bundleLength);
+        if (munmap(mem, bundleLength) == -1) {
+            std::cerr << "munmap error:" << ::strerror(errno) << std::endl;
+        }
+    } else {
+        // fallback to read blocks
+        posix_fadvise(fd, bundleOffset, bundleLength, POSIX_FADV_WILLNEED | POSIX_FADV_SEQUENTIAL);
+        std::align_val_t alignment{ default_page_size };
+        if (auto ret = sysconf(_SC_PAGESIZE); ret > 0) {
+            alignment = static_cast<std::align_val_t>(ret);
+        }
 
-    auto closeFile = defer([file] {
-        ::close(file);
-    });
+        auto chunkSize = getChunkSize(bundleLength);
+        auto *buf = ::operator new(chunkSize, alignment, std::nothrow);
+        if (buf == nullptr) {
+            std::cerr << "failed to allocate aligned memory" << std::endl;
+            return {};
+        }
 
-    if (::lseek(file, bundleOffset, SEEK_SET) == -1) {
-        std::cerr << "lseek() error:" << ::strerror(errno) << std::endl;
-        return {};
-    }
+        auto deleter = [alignment](void *ptr) noexcept {
+            ::operator delete(ptr, alignment, std::nothrow);
+        };
+        std::unique_ptr<std::byte, decltype(deleter)> buffer{ reinterpret_cast<std::byte *>(buf),
+                                                              deleter };
 
-    auto ctxDeleter = [](EVP_MD_CTX *self) {
-        EVP_MD_CTX_free(self);
-    };
-    auto ctx =
-      std::unique_ptr<EVP_MD_CTX, decltype(ctxDeleter)>(EVP_MD_CTX_new(), std::move(ctxDeleter));
-    if (EVP_DigestInit_ex2(ctx.get(), EVP_sha256(), nullptr) == 0) {
-        std::cerr << "init digest context error" << std::endl;
-        return {};
-    }
+        std::size_t totalRead{ 0 };
+        while (totalRead < bundleLength) {
+            auto remaining = bundleLength - totalRead;
+            auto readBytes = std::min(remaining, chunkSize);
 
-    std::array<unsigned char, 4096> buf{};
-    std::array<unsigned char, EVP_MAX_MD_SIZE> md_value{};
-    auto expectedRead = buf.size();
-    int readLength{ 0 };
-    unsigned int digestLength{ 0 };
+            auto bytesRead = pread(fd, buffer.get(), readBytes, bundleOffset + totalRead);
+            if (bytesRead < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
 
-    while ((readLength = ::read(file, buf.data(), expectedRead)) != 0) {
-        if (readLength == -1) {
-            if (errno == EINTR) {
-                continue;
+                std::cerr << "read uab error:" << ::strerror(errno) << std::endl;
+                return {};
             }
 
-            std::cerr << "read bundle error:" << ::strerror(errno) << std::endl;
-            return {};
-        }
-
-        if (EVP_DigestUpdate(ctx.get(), buf.data(), readLength) == 0) {
-            std::cerr << "update digest error" << std::endl;
-            return {};
-        }
-
-        bundleLength -= readLength;
-        if (bundleLength == 0) {
-            if (EVP_DigestFinal(ctx.get(), md_value.data(), &digestLength) == 1) {
+            if (bytesRead == 0) {
                 break;
             }
 
-            std::cerr << "get digest error" << std::endl;
+            sha256.update(buffer.get(), bytesRead);
+            totalRead += bytesRead;
+        }
+        if (totalRead != bundleLength) {
+            std::cerr << "unexpected end of UAB section" << std::endl;
             return {};
         }
-
-        expectedRead = bundleLength > buf.size() ? buf.size() : bundleLength;
     }
+
+    sha256.final(digest.data());
 
     std::stringstream stream;
     stream << std::setfill('0') << std::hex;
 
-    for (auto i = 0U; i < digestLength; i++) {
-        stream << std::setw(2) << static_cast<unsigned int>(md_value.at(i));
+    for (auto v : digest) {
+        stream << std::setw(2) << static_cast<unsigned int>(v);
     }
 
     return stream.str();
 }
 
-int mountSelfBundle(std::string_view selfBin,
-                    const linglong::api::types::v1::UabMetaInfo &meta) noexcept
+std::string calculateDigest(std::string_view data) noexcept
 {
-    auto selfBinFd = ::open(selfBin.data(), O_RDONLY | O_CLOEXEC);
-    if (selfBinFd == -1) {
-        std::cerr << "failed to open bundle " << selfBin << std::endl;
-        return {};
+    digest::SHA256 sha256;
+    std::array<std::byte, 32> digest{};
+    sha256.update(reinterpret_cast<const std::byte *>(data.data()), data.size());
+    sha256.final(digest.data());
+
+    std::stringstream stream;
+    stream << std::setfill('0') << std::hex;
+    for (auto value : digest) {
+        stream << std::setw(2) << static_cast<unsigned int>(value);
+    }
+    return stream.str();
+}
+
+std::optional<std::filesystem::path> find_fusermount() noexcept
+{
+    auto *pathEnv = getenv("PATH");
+    if (pathEnv == nullptr) {
+        return std::nullopt;
     }
 
-    auto closeSelfBin = defer([selfBinFd] {
-        ::close(selfBinFd);
-    });
+    auto search_dir = [](const std::filesystem::path &dir) -> std::optional<std::filesystem::path> {
+        std::error_code ec;
+        auto iter = std::filesystem::directory_iterator{
+            dir,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        };
 
-    auto bundleSh = getSectionHeader(selfBinFd, meta.sections.bundle);
+        if (ec) {
+            std::cerr << "failed to open directory " << dir << ": " << ec.message() << std::endl;
+            return std::nullopt;
+        }
+
+        for (const auto &entry : iter) {
+            std::string filename = entry.path().filename();
+            if (filename.rfind("fusermount", 0) != 0) {
+                continue;
+            }
+
+            if (filename.substr(10).find_first_not_of("0123456789") != std::string::npos) {
+                continue;
+            }
+
+            struct stat sb{};
+            if (stat(entry.path().c_str(), &sb) == -1) {
+                std::cerr << "stat error: " << strerror(errno) << std::endl;
+                continue;
+            }
+
+            if (sb.st_uid != 0 || (sb.st_mode & S_ISUID) == 0) {
+                std::cerr << "skip " << entry.path() << std::endl;
+                continue;
+            }
+
+            return entry.path();
+        }
+
+        return std::nullopt;
+    };
+
+    std::stringstream ss{ pathEnv };
+    std::string path;
+    while (std::getline(ss, path, ':')) {
+        auto res = search_dir(path);
+        if (res) {
+            return res;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<linglong::api::types::v1::UabMetaInfo>
+getVerifiedMetaInfo(const lightElf::native_elf &elf) noexcept
+{
+    const auto signatureSh =
+      elf.getSectionHeader(std::string{ linglong::common::uab::signatureSection });
+    if (!signatureSh || signatureSh->sh_size != sizeof(linglong::common::uab::MetaSignatureNote)) {
+        std::cerr << "UAB signature section is missing or invalid" << std::endl;
+        return std::nullopt;
+    }
+
+    std::string noteData(signatureSh->sh_size, '\0');
+    const auto bytesRead =
+      ::pread(elf.underlyingFd(), noteData.data(), signatureSh->sh_size, signatureSh->sh_offset);
+    if (bytesRead != static_cast<ssize_t>(signatureSh->sh_size)) {
+        std::cerr << "failed to read UAB signature section: " << ::strerror(errno) << std::endl;
+        return std::nullopt;
+    }
+
+    const auto expectedMetaDigest = linglong::common::uab::parseSignatureNote(noteData);
+    if (!expectedMetaDigest || !linglong::common::uab::isDigest(*expectedMetaDigest)) {
+        std::cerr << "UAB signature section contains an invalid meta digest" << std::endl;
+        return std::nullopt;
+    }
+
+    const auto metaSh = elf.getSectionHeader(std::string{ linglong::common::uab::metaSection });
+    if (!metaSh || metaSh->sh_type == SHT_NOBITS) {
+        std::cerr << "couldn't find a valid meta section" << std::endl;
+        return std::nullopt;
+    }
+
+    std::string metaData(metaSh->sh_size, '\0');
+    const auto metaBytesRead =
+      ::pread(elf.underlyingFd(), metaData.data(), metaSh->sh_size, metaSh->sh_offset);
+    if (metaBytesRead != static_cast<ssize_t>(metaSh->sh_size)) {
+        std::cerr << "failed to read meta section: " << ::strerror(errno) << std::endl;
+        return std::nullopt;
+    }
+    if (calculateDigest(metaData) != *expectedMetaDigest) {
+        std::cerr << "linglong.meta digest mismatched" << std::endl;
+        return std::nullopt;
+    }
+
+    std::optional<linglong::api::types::v1::UabMetaInfo> meta;
+    try {
+        meta = nlohmann::json::parse(metaData).get<linglong::api::types::v1::UabMetaInfo>();
+    } catch (const std::exception &e) {
+        std::cerr << "failed to parse verified meta section: " << e.what() << std::endl;
+        return std::nullopt;
+    }
+    if (!linglong::common::uab::isDigest(meta->digest)) {
+        std::cerr << "linglong.meta contains an invalid bundle digest" << std::endl;
+        return std::nullopt;
+    }
+
+    return meta;
+}
+
+int mountSelfBundle(const lightElf::native_elf &elf,
+                    const linglong::api::types::v1::UabMetaInfo &meta) noexcept
+{
+    auto bundleSh = elf.getSectionHeader(meta.sections.bundle);
     if (!bundleSh) {
         std::cerr << "couldn't get bundle section '" << meta.sections.bundle << "'" << std::endl;
         return -1;
     }
-
-    auto bundleOffset = bundleSh->sh_offset;
-    if (auto digest = calculateDigest(selfBinFd, bundleOffset, bundleSh->sh_size);
-        digest != meta.digest) {
-        std::cerr << "sha256 mismatched, expected: " << meta.digest << " calculated: " << digest
-                  << std::endl;
+    if (bundleSh->sh_type == SHT_NOBITS) {
+        std::cerr << "bundle section has no file data" << std::endl;
         return -1;
     }
 
+    const auto bundleDigest =
+      calculateDigest(elf.underlyingFd(), bundleSh->sh_offset, bundleSh->sh_size);
+    if (bundleDigest != meta.digest) {
+        std::cerr << "bundle digest mismatched, expected: " << meta.digest
+                  << " calculated: " << bundleDigest << std::endl;
+        return -1;
+    }
+
+    auto bundleOffset = bundleSh->sh_offset;
+    auto selfBin = elf.absolutePath();
     auto offsetStr = "--offset=" + std::to_string(bundleOffset);
     std::array<const char *, 4> erofs_argv = { "erofsfuse",
                                                offsetStr.c_str(),
-                                               selfBin.data(),
+                                               selfBin.c_str(),
                                                mountPoint.c_str() };
 
     auto fusePid = fork();
@@ -378,20 +362,39 @@ int mountSelfBundle(std::string_view selfBin,
             }
         }
 
-        return erofsfuse_main(4, const_cast<char **>(erofs_argv.data()));
+        if (getenv("FUSERMOUNT_PROG") == nullptr) {
+            auto fuserMountProg = find_fusermount();
+            if (fuserMountProg) {
+                setenv("FUSERMOUNT_PROG", fuserMountProg.value().c_str(), 1);
+                std::cerr << "use fusermount:" << fuserMountProg->string() << std::endl;
+            } else {
+                std::cerr << "fusermount not found" << std::endl;
+            }
+        }
+
+        _exit(erofsfuse_main(4, const_cast<char **>(erofs_argv.data())));
     }
 
     int status{ 0 };
-    auto ret = ::waitpid(fusePid, &status, 0);
-    if (ret == -1) {
-        std::cerr << "waitpid() failed:" << ::strerror(errno) << std::endl;
-        return -1;
+    while (true) {
+        auto ret = ::waitpid(fusePid, &status, 0);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "waitpid() failed:" << ::strerror(errno) << std::endl;
+            return -1;
+        }
+        break;
     }
 
-    ret = WEXITSTATUS(status);
-    if (ret != 0) {
-        std::cerr << "couldn't mount bundle, fuse error code:" << ret << std::endl;
-        ret = -1;
+    int ret{ -1 };
+    if (WIFEXITED(status)) {
+        auto code = WEXITSTATUS(status);
+        ret = code;
+    } else if (WIFSIGNALED(status)) {
+        auto sig = WTERMSIG(status);
+        std::cerr << "erofsfuse terminated due to signal " << strsignal(sig) << std::endl;
     }
 
     return ret;
@@ -399,75 +402,68 @@ int mountSelfBundle(std::string_view selfBin,
 
 void cleanResource() noexcept
 {
-    if (!createFlag.load()) {
+    if (!mountFlag.load(std::memory_order_relaxed)) {
         return;
     }
 
+    auto pid = fork();
+    if (pid < 0) {
+        std::cerr << "fork() error" << ": " << ::strerror(errno) << std::endl;
+        return;
+    }
+
+    if (pid == 0) {
+        if (::execlp("fusermount", "fusermount", "-z", "-u", mountPoint.c_str(), nullptr) == -1) {
+            std::cerr << "fusermount error: " << ::strerror(errno) << std::endl;
+            ::_exit(1);
+        }
+
+        ::_exit(0);
+    }
+
+    int status{ 0 };
+    auto ret = ::waitpid(pid, &status, 0);
+    if (ret == -1) {
+        std::cerr << "wait failed:" << ::strerror(errno) << std::endl;
+        return;
+    }
+    mountFlag.store(false, std::memory_order_relaxed);
+
+    if (!createFlag.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    // try to remove mount point
     std::error_code ec;
-    if (!std::filesystem::exists(mountPoint, ec)) {
-        if (ec) {
-            std::cerr << "filesystem error:" << ec.message() << std::endl;
-        }
+    if (std::filesystem::remove_all(mountPoint, ec) == static_cast<std::uintmax_t>(-1) && ec) {
+        std::cerr << "failed to remove mount point:" << ec.message() << std::endl;
         return;
     }
 
-    [] {
-        if (!mountFlag.load()) {
-            return;
-        }
-
-        auto pid = fork();
-        if (pid < 0) {
-            std::cerr << "fork() error" << ": " << strerror(errno) << std::endl;
-            return;
-        }
-
-        if (pid == 0) {
-            if (::execlp("umount", "umount", mountPoint.c_str(), nullptr) == -1) {
-                std::cerr << "umount error: " << strerror(errno) << std::endl;
-                return;
-            }
-        }
-
-        int status{ 0 };
-        auto ret = ::waitpid(pid, &status, 0);
-        if (ret == -1) {
-            std::cerr << "wait failed:" << strerror(errno) << std::endl;
-            return;
-        }
-    }();
-
-    if (!std::filesystem::remove(mountPoint, ec)) {
-        if (ec) {
-            std::cerr << "failed to remove mount point:" << ec.message() << std::endl;
-        }
-    }
+    createFlag.store(false, std::memory_order_relaxed);
 }
 
-[[noreturn]] static void cleanAndExit(int exitCode) noexcept
+[[noreturn]] void cleanAndExit(int exitCode) noexcept
 {
     cleanResource();
-    ::exit(exitCode);
+    ::_exit(exitCode);
 }
 
 void handleSig() noexcept
 {
-    auto handler = [](int sig) -> void {
-        cleanAndExit(sig);
-    };
-
     sigset_t blocking_mask;
     sigemptyset(&blocking_mask);
-    auto quitSignals = { SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGABRT, SIGSEGV };
+    auto quitSignals = { SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGABRT };
     for (auto sig : quitSignals) {
         sigaddset(&blocking_mask, sig);
     }
 
-    struct sigaction sa
-    {
-    };
+    struct sigaction sa{};
 
-    sa.sa_handler = handler;
+    sa.sa_handler = [](int sig) -> void {
+        // TODO: maybe not async safe, find a better way to handle signal
+        cleanAndExit(128 + sig);
+    };
     sa.sa_mask = blocking_mask;
     sa.sa_flags = 0;
 
@@ -478,6 +474,11 @@ void handleSig() noexcept
 
 int createMountPoint(std::string_view uuid) noexcept
 {
+    if (createFlag.load(std::memory_order_relaxed)) {
+        std::cout << "mount point already has been created" << std::endl;
+        return 0;
+    }
+
     const char *runtimeDirPtr{ nullptr };
     runtimeDirPtr = ::getenv("XDG_RUNTIME_DIR");
     if (runtimeDirPtr == nullptr) {
@@ -485,103 +486,30 @@ int createMountPoint(std::string_view uuid) noexcept
         runtimeDirPtr = "/tmp";
     }
 
-    auto mountPointPath =
-      std::filesystem::path{ resolveRealPath(runtimeDirPtr) } / "linglong/UAB" / uuid;
-
-    std::error_code ec;
-    if (!std::filesystem::create_directories(mountPointPath, ec)) {
-        if (ec.value() != EEXIST) {
-            std::cerr << "couldn't create mount point " << mountPoint << ": " << ec.message()
-                      << std::endl;
-            return ec.value();
-        }
-    }
-
-    mountPoint = mountPointPath.string();
-    bool expected{ false };
-    if (!createFlag.compare_exchange_strong(expected, true)) {
-        std::cerr << "internal create flag error" << std::endl;
+    auto runtimeDir = resolveRealPath(runtimeDirPtr);
+    if (runtimeDir.empty()) {
         return -1;
     }
+    auto mountPointPath = std::filesystem::path{ runtimeDir } / "linglong" / "UAB" / uuid;
+
+    std::error_code ec;
+    if (!std::filesystem::create_directories(mountPointPath, ec) && ec) {
+        std::cerr << "couldn't create mount point " << mountPointPath << ": " << ec.message()
+                  << std::endl;
+        return ec.value();
+    }
+
+    mountPoint = std::move(mountPointPath);
+    createFlag.store(true, std::memory_order_relaxed);
 
     return 0;
-}
-
-std::optional<linglong::api::types::v1::UabMetaInfo> getMetaInfo(std::string_view uab) noexcept
-{
-    auto selfBinFd = ::open(uab.data(), O_RDONLY);
-    if (selfBinFd == -1) {
-        std::cerr << "failed to open bundle " << uab << std::endl;
-        return std::nullopt;
-    }
-
-    auto closeUAB = defer([selfBinFd] {
-        ::close(selfBinFd);
-    });
-
-    auto metaSh = getSectionHeader(selfBinFd, "linglong.meta");
-    if (!metaSh) {
-        std::cerr << "couldn't find meta section" << std::endl;
-        return std::nullopt;
-    }
-
-    if (::lseek(selfBinFd, metaSh->sh_offset, SEEK_SET) == -1) {
-        std::cerr << "lseek failed:" << ::strerror(errno) << std::endl;
-        return std::nullopt;
-    }
-
-    std::string content;
-    content.resize(metaSh->sh_size, 0);
-    if (::read(selfBinFd, content.data(), content.size()) == -1) {
-        std::cerr << "read failed:" << ::strerror(errno) << std::endl;
-        return {};
-    }
-
-    nlohmann::json meta;
-    try {
-        meta = nlohmann::json::parse(content);
-    } catch (nlohmann::json::parse_error &ex) {
-        std::cerr << "parse error: " << ex.what() << std::endl;
-    }
-
-    return meta;
 }
 
 int extractBundle(std::string_view destination) noexcept
 {
     std::error_code ec;
-    auto path = std::filesystem::path(destination);
-    if (!std::filesystem::exists(path.parent_path(), ec)) {
-        std::cerr << path.parent_path() << ": " << ec.message() << std::endl;
-        return ec.value();
-    }
-
-    if (!std::filesystem::create_directory(path, path.parent_path(), ec)) {
-        if (ec) {
-            std::cerr << "create " << path << ":" << ec.message() << std::endl;
-            return ec.value();
-        }
-    }
-
-    if (!std::filesystem::is_directory(path, ec)) {
-        std::cerr << path;
-        if (ec) {
-            std::cerr << ":" << ec.message();
-        } else {
-            std::cerr << " isn't a directory";
-        }
-        std::cerr << std::endl;
-        return ec.value();
-    }
-
-    if (!std::filesystem::is_empty(path, ec)) {
-        std::cerr << path;
-        if (ec) {
-            std::cerr << ":" << ec.message();
-        } else {
-            std::cerr << " isn't empty";
-        }
-        std::cerr << std::endl;
+    if (!std::filesystem::create_directories(destination, ec) && ec) {
+        std::cerr << "failed to create " << destination << ": " << ec.message() << std::endl;
         return ec.value();
     }
 
@@ -597,93 +525,53 @@ int extractBundle(std::string_view destination) noexcept
     return 0;
 }
 
-[[noreturn]] void runAppLoader(const linglong::api::types::v1::UabMetaInfo &meta,
-                               const std::vector<std::string_view> &loaderArgs) noexcept
+int runAppLoader(const std::vector<std::string_view> &loaderArgs) noexcept
 {
-    auto loader = std::filesystem::path{ mountPoint } / "loader";
-    auto loaderStr = loader.string();
+    auto loader = mountPoint / "loader";
+    std::error_code ec;
+    if (!std::filesystem::exists(loader, ec)) {
+        if (ec) {
+            std::cerr << "failed to get loader status" << std::endl;
+            return -1;
+        }
+
+        std::cout << "This UAB is not support for running" << std::endl;
+        return 0;
+    }
+
     auto argc = loaderArgs.size() + 2;
     auto *argv = new (std::nothrow) const char *[argc]();
     if (argv == nullptr) {
         std::cerr << "out of memory, exit." << std::endl;
-        cleanAndExit(ENOMEM);
+        return ENOMEM;
     }
 
     auto deleter = defer([argv] {
         delete[] argv;
     });
 
-    argv[0] = loaderStr.c_str();
+    argv[0] = loader.c_str();
     argv[argc - 1] = nullptr;
     for (std::size_t i = 0; i < loaderArgs.size(); ++i) {
         argv[i + 1] = loaderArgs[i].data();
     }
 
-    std::string baseID;
-    std::string runtimeID;
-    std::string appID;
-    for (const auto &layer : meta.layers) {
-        const auto &kind = layer.info.kind;
-        if (kind == "app") {
-            appID = layer.info.id;
-
-            const auto &baseStr = layer.info.base;
-            auto splitSlash = std::find(baseStr.cbegin(), baseStr.cend(), '/');
-            auto splitColon = std::find(baseStr.cbegin(), baseStr.cend(), ':');
-            baseID = baseStr.substr(std::distance(baseStr.cbegin(), splitColon) + 1,
-                                    splitSlash - splitColon - 1);
-
-            if (layer.info.runtime) {
-                const auto &runtimeStr = layer.info.runtime.value();
-                auto splitSlash = std::find(runtimeStr.cbegin(), runtimeStr.cend(), '/');
-                auto splitColon = std::find(runtimeStr.cbegin(), runtimeStr.cend(), ':');
-                runtimeID = runtimeStr.substr(std::distance(baseStr.cbegin(), splitColon) + 1,
-                                              splitSlash - splitColon - 1);
-            }
-
-            break;
-        }
-    }
-
-    if (baseID.empty() || appID.empty()) {
-        std::cerr << "failed to get all ids," << " base id: " << baseID << " app id: " << appID
-                  << std::endl;
-        cleanAndExit(-1);
-    }
-
     auto loaderPid = fork();
     if (loaderPid < 0) {
         std::cerr << "fork() error" << ": " << ::strerror(errno) << std::endl;
-        cleanAndExit(errno);
+        return errno;
     }
 
     if (loaderPid == 0) {
-        if (::setenv("UAB_BASE_ID", baseID.data(), 1) == -1) {
-            std::cerr << "setenv() error:" << ::strerror(errno) << std::endl;
-            cleanAndExit(errno);
+        if (::setenv("LINGLONG_UAB_LOADER_ONLY_APP", "true", 1) < 0) {
+            std::cerr << "setenv error: " << ::strerror(errno) << std::endl;
+            return errno;
         }
 
-        if (!runtimeID.empty() && ::setenv("UAB_RUNTIME_ID", runtimeID.data(), 1) == -1) {
-            std::cerr << "setenv() error:" << ::strerror(errno) << std::endl;
-            cleanAndExit(errno);
-        }
-
-        if (::setenv("UAB_APP_ID", appID.data(), 1) == -1) {
-            std::cerr << "setenv() error:" << ::strerror(errno) << std::endl;
-            cleanAndExit(errno);
-        }
-
-        std::error_code ec;
-        std::filesystem::current_path(mountPoint, ec);
-        if (ec) {
-            std::cerr << "changing working directory failed: " << ec.message() << std::endl;
-            cleanAndExit(errno);
-        }
-
-        if (::execv(loaderStr.c_str(), reinterpret_cast<char *const *>(const_cast<char **>(argv)))
+        if (::execv(loader.c_str(), reinterpret_cast<char *const *>(const_cast<char **>(argv)))
             == -1) {
-            std::cerr << "execv(" << loaderStr << ") error: " << ::strerror(errno) << std::endl;
-            cleanAndExit(errno);
+            std::cerr << "execv(" << loader << ") error: " << ::strerror(errno) << std::endl;
+            return errno;
         }
     }
 
@@ -691,41 +579,21 @@ int extractBundle(std::string_view destination) noexcept
     auto ret = ::waitpid(loaderPid, &status, 0);
     if (ret == -1) {
         std::cerr << "waitpid failed:" << ::strerror(errno) << std::endl;
-        cleanAndExit(errno);
+        return errno;
     }
 
-    cleanAndExit(WEXITSTATUS(status));
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        // maybe we running under a shell
+        return 128 + WTERMSIG(status);
+    }
+
+    std::cerr << "unknown exit state of loader" << std::endl;
+    return -1;
 }
-
-[[noreturn]] void
-runAppLinglong(std::string_view cliBin,
-               const linglong::api::types::v1::UabLayer &layer,
-               [[maybe_unused]] const std::vector<std::string_view> &loaderArgs) noexcept
-{
-    const auto &appId = layer.info.id;
-    std::array<const char *, 4> argv{};
-    argv[0] = cliBin.data();
-    argv[1] = "run";
-    argv[2] = appId.c_str();
-    argv[3] = nullptr;
-
-    cleanAndExit(
-      ::execv(cliBin.data(), reinterpret_cast<char *const *>(const_cast<char **>(argv.data()))));
-}
-
-enum uabOption {
-    Help = 1,
-    Extract,
-    Meta,
-};
-
-struct argOption
-{
-    bool help{ false };
-    bool printMeta{ false };
-    std::string extractPath;
-    std::vector<std::string_view> loaderArgs;
-};
 
 argOption parseArgs(const std::vector<std::string_view> &args)
 {
@@ -740,9 +608,10 @@ argOption parseArgs(const std::vector<std::string_view> &args)
         opts.loaderArgs.assign(splitter + 1, args.cend());
     }
 
-    std::array<struct option, 4> long_options{
+    std::array<struct option, 5> long_options{
         { { "print-meta", no_argument, nullptr, uabOption::Meta },
           { "extract", required_argument, nullptr, uabOption::Extract },
+          { "mount", required_argument, nullptr, uabOption::Mount },
           { "help", no_argument, nullptr, uabOption::Help },
           { nullptr, 0, nullptr, 0 } }
     };
@@ -769,12 +638,18 @@ argOption parseArgs(const std::vector<std::string_view> &args)
             opts.extractPath = optarg;
             ++counter;
         } break;
+        case uabOption::Mount: {
+            opts.mountPath = optarg;
+            ++counter;
+        } break;
         case uabOption::Help: {
             opts.help = true;
             ++counter;
         } break;
+        case '?':
+            ::exit(EINVAL);
         default:
-            break;
+            throw std::logic_error("UNREACHABLE!! unknown option:" + std::to_string(ch));
         }
     }
 
@@ -786,30 +661,45 @@ argOption parseArgs(const std::vector<std::string_view> &args)
     return opts;
 }
 
-int mountSelf(std::string_view selfBin,
-              const linglong::api::types::v1::UabMetaInfo &metaInfo) noexcept
+int mountSelf(const lightElf::native_elf &elf,
+              const linglong::api::types::v1::UabMetaInfo &metaInfo,
+              const std::filesystem::path &mp = {}) noexcept
 {
-    const auto &uuid = metaInfo.uuid;
-    if (auto ret = createMountPoint(uuid); ret != 0) {
+    if (mountFlag.load(std::memory_order_relaxed)) {
+        std::cout << "bundle already has been mounted" << std::endl;
+        return 0;
+    }
+
+    if (mp.empty()) {
+        const auto &uuid = metaInfo.uuid;
+        if (auto ret = createMountPoint(uuid); ret != 0) {
+            return ret;
+        }
+    } else {
+        std::error_code ec;
+        auto state = std::filesystem::status(mp, ec);
+        if (ec) {
+            std::cerr << "failed to status " + mp.string() + ": " + ec.message() << std::endl;
+            return -1;
+        }
+        if (!std::filesystem::is_directory(state)) {
+            std::cerr << mp.string() << "is not a directory" << std::endl;
+            return -1;
+        }
+        mountPoint = mp;
+    }
+
+    if (auto ret = mountSelfBundle(elf, metaInfo); ret != 0) {
         return ret;
     }
 
-    if (auto ret = mountSelfBundle(selfBin, metaInfo); ret != 0) {
-        return -1;
-    }
-
-    bool expected{ false };
-    if (!mountFlag.compare_exchange_strong(expected, true)) {
-        std::cerr << "internal create flag error" << std::endl;
-        return -1;
-    }
-
+    mountFlag.store(true, std::memory_order_relaxed);
     return 0;
 }
+} // namespace
 
 int main(int argc, char **argv)
 {
-    elf_version(EV_CURRENT);
     handleSig();
 
     std::vector<std::string_view> args;
@@ -826,9 +716,10 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    auto metaInfoRet = getMetaInfo(selfBin);
+    lightElf::native_elf elf(selfBin);
+    auto metaInfoRet = getVerifiedMetaInfo(elf);
     if (!metaInfoRet) {
-        std::cerr << "couldn't get metaInfo of this uab file" << std::endl;
+        std::cerr << "couldn't verify metaInfo of this uab file" << std::endl;
         return -1;
     }
     const auto &metaInfo = *metaInfoRet;
@@ -838,51 +729,59 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    // for cleaning up mount point
+    if (std::atexit(cleanResource) != 0) {
+        std::cerr << "failed register exit handler" << std::endl;
+        return 1;
+    }
+
+    std::set_terminate([]() {
+        cleanResource();
+        std::abort();
+    });
+
+    if (auto ret = mountSelf(elf, metaInfo, opts.mountPath); ret != 0) {
+        return ret;
+    }
+
+    bool mountOnly = !opts.mountPath.empty();
+    if (mountOnly) {
+        while (true) {
+            pause();
+        }
+    }
+
     if (!opts.extractPath.empty()) {
-        opts.extractPath = resolveRealPath(opts.extractPath);
-        if (opts.extractPath.empty()) {
-            std::cerr << "couldn't resolve extractPath" << std::endl;
-            return -1;
+        return extractBundle(opts.extractPath);
+    }
+
+    const bool onlyApp = metaInfo.onlyApp.value_or(false);
+
+    if (!onlyApp) {
+        std::cout << "This UAB is not support for running" << std::endl;
+        return 0;
+    }
+
+    std::string appID;
+    std::string module;
+    for (const auto &layer : metaInfo.layers) {
+        if (layer.info.kind == "app") {
+            appID = layer.info.id;
+            module = layer.info.packageInfoV2Module;
+            break;
         }
-
-        if (mountSelf(selfBin, metaInfo) != 0) {
-            cleanAndExit(-1);
-        }
-
-        cleanAndExit(extractBundle(opts.extractPath));
     }
 
-    const auto &layersRef = metaInfo.layers;
-    const auto &appLayer = std::find_if(layersRef.cbegin(),
-                                        layersRef.cend(),
-                                        [](const linglong::api::types::v1::UabLayer &layer) {
-                                            return layer.info.kind == "app";
-                                        });
-
-    if (appLayer == layersRef.cend()) {
-        std::cerr << "couldn't find application layer" << std::endl;
-        return -1;
-    }
-    const auto &appInfo = appLayer->info;
-
-    auto cliPath = detectLinglong();
-    auto appRef =
-      appInfo.channel + ":" + appInfo.id + "/" + appInfo.version + "/" + appInfo.arch[0];
-    if (!cliPath.empty()) {
-        if (importSelf(cliPath, appRef, selfBin) != 0) {
-            std::cerr << "failed to import uab by ll-cli" << std::endl;
-            return -1;
-        }
-
-        std::cout << "import uab to linglong successfully, delegate running operation to linglong."
-                  << std::endl;
-
-        runAppLinglong(cliPath, *appLayer, opts.loaderArgs);
+    if (appID.empty() || module.empty()) {
+        std::cerr << "failed to find appID and module" << std::endl;
+        return 1;
     }
 
-    if (mountSelf(selfBin, metaInfo) != 0) {
-        cleanAndExit(-1);
+    std::string envAppRoot = std::string(mountPoint) + "/layers/" + appID + "/" + module + "/files";
+    if (::setenv("LINGLONG_UAB_APPROOT", const_cast<char *>(envAppRoot.data()), 1) == -1) {
+        std::cerr << "setenv error: " << ::strerror(errno) << std::endl;
+        return 1;
     }
 
-    runAppLoader(metaInfo, opts.loaderArgs);
+    return runAppLoader(opts.loaderArgs);
 }

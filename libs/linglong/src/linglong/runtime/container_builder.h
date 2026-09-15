@@ -1,50 +1,143 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_RUNTIME_CONTAINER_BUILDER_H_
-#define LINGLONG_RUNTIME_CONTAINER_BUILDER_H_
+#pragma once
 
-#include "linglong/api/types/v1/OciConfigurationPatch.hpp"
+#include "linglong/api/types/v1/Generators.hpp"
+#include "linglong/api/types/v1/RunContextConfig.hpp"
+#include "linglong/api/types/v1/RuntimeConfigure.hpp"
+#include "linglong/oci-cfg-generators/container_cfg_builder.h"
 #include "linglong/runtime/container.h"
+#include "linglong/runtime/security_context.h"
 #include "linglong/utils/error/error.h"
 #include "ocppi/cli/CLI.hpp"
-#include "ocppi/runtime/config/types/Mount.hpp"
 
-#include <QDir>
-#include <QProcess>
+#include <QCryptographicHash>
+
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <optional>
+
+namespace linglong::cli {
+struct RunOptions;
+}
 
 namespace linglong::runtime {
 
-struct ContainerOptions
+class RunContext;
+
+// Used to obtain a clean container bundle directory.
+utils::error::Result<std::filesystem::path> makeBundleDir(const std::string &containerID,
+                                                          const std::string &bundleSuffix = "");
+
+std::string genContainerID(const api::types::v1::RunContextConfig &config) noexcept;
+
+struct CommonContainerOptions
 {
-    QString appID;
-    QString containerID;
-
-    std::optional<QDir> runtimeDir; // mount to /runtime
-    QDir baseDir;                   // mount to /
-    std::optional<QDir> appDir;     // mount to /opt/apps/${info.appid}/files
-
-    std::vector<api::types::v1::OciConfigurationPatch> patches;
-    std::vector<ocppi::runtime::config::types::Mount> mounts; // extra mounts
-    std::vector<std::string> masks;
+    std::optional<std::filesystem::path> containerCachePath;
+    std::vector<ocppi::runtime::config::types::Mount> extraMounts;
 };
 
-class ContainerBuilder : public QObject
+struct RunContainerOptions
 {
-    Q_OBJECT
+    auto applyRuntimeConfig(const api::types::v1::RuntimeConfigure &runtimeConfig) noexcept
+      -> utils::error::Result<void>;
+    auto applyCliRunOptions(const cli::RunOptions &options) noexcept -> utils::error::Result<void>;
+    void enableSecurityContext(const std::vector<SecurityContextType> &ctxs);
+    [[nodiscard]] auto getEnv() const noexcept -> const std::map<std::string, std::string> &;
+    [[nodiscard]] auto getCapabilities() const noexcept -> const std::vector<std::string> &;
+    [[nodiscard]] auto getSecurityContexts() const noexcept
+      -> const std::vector<SecurityContextType> &;
+    [[nodiscard]] auto isDevicePassthruEnabled() const noexcept -> bool;
+    [[nodiscard]] auto isXdpDisabled() const noexcept -> bool;
+    [[nodiscard]] auto isPipewireSocketMountEnabled() const noexcept -> bool;
+    [[nodiscard]] auto isAtSpiSocketMountEnabled() const noexcept -> bool;
+    [[nodiscard]] auto isPrivileged() const noexcept -> bool;
+
+    CommonContainerOptions common;
+
+    std::string lockName;
+    bool disableXdp{ false };
+    bool enablePipewireSocketMount{ false };
+    bool enableAtSpiSocketMount{ false };
+    bool privileged{ false };
+    bool devicePassthru{ false };
+    std::map<std::string, std::string> env;
+    std::vector<std::string> capabilities;
+    std::vector<SecurityContextType> securityContexts;
+};
+
+struct BuilderContainerOptions
+{
+    CommonContainerOptions common;
+    // overwrite base path and runtime path
+    std::filesystem::path basePath;
+    std::optional<std::filesystem::path> runtimePath;
+    bool isolateNetWork{ false };
+    std::vector<std::string> masks;
+    std::vector<ocppi::runtime::config::types::Hook> startContainerHooks;
+};
+
+class ContainerBuilder
+{
 public:
     explicit ContainerBuilder(ocppi::cli::CLI &cli);
 
-    auto create(const ContainerOptions &opts) noexcept
-      -> utils::error::Result<QSharedPointer<Container>>;
+    auto createBuildContainer(runtime::RunContext &context,
+                              const BuilderContainerOptions &options) noexcept
+      -> utils::error::Result<std::unique_ptr<Container>>;
+
+    auto createInitContainer(runtime::RunContext &context,
+                             const CommonContainerOptions &options = {}) noexcept
+      -> utils::error::Result<std::unique_ptr<Container>>;
+
+    auto createRunContainer(runtime::RunContext &context,
+                            const RunContainerOptions &options) noexcept
+      -> utils::error::Result<std::unique_ptr<Container>>;
 
 private:
+    enum class ContainerMode : uint8_t {
+        Init,
+        Build,
+        Run,
+    };
+
+    struct PreparedContainer
+    {
+        generator::ContainerCfgBuilder cfgBuilder;
+        runtime::RunContext *runContext{ nullptr };
+        std::unique_ptr<ContainerContext> context;
+        ContainerMode mode{ ContainerMode::Run };
+    };
+
+    auto create(const linglong::generator::ContainerCfgBuilder &cfgBuilder,
+                std::unique_ptr<ContainerContext> context) noexcept
+      -> utils::error::Result<std::unique_ptr<Container>>;
+    auto prepareContainer(runtime::RunContext &context,
+                          ContainerMode mode,
+                          const CommonContainerOptions &options = {}) noexcept
+      -> utils::error::Result<PreparedContainer>;
+    static auto bundleSuffixFor(ContainerMode mode) -> std::string;
+    static auto overlayReadOnlyFor(ContainerMode mode) -> bool;
+    static auto appCacheReadOnlyFor(ContainerMode mode) -> bool;
+    auto configureInitContainer(PreparedContainer &prepared) noexcept -> utils::error::Result<void>;
+    auto finalizeContainer(PreparedContainer &prepared) noexcept
+      -> utils::error::Result<std::unique_ptr<Container>>;
+    auto configureBuildContainer(PreparedContainer &prepared,
+                                 const BuilderContainerOptions &options) noexcept
+      -> utils::error::Result<void>;
+    auto configureRunContainer(PreparedContainer &prepared,
+                               const RunContainerOptions &options) noexcept
+      -> utils::error::Result<void>;
+    auto normalizeContainerRootfs(const std::filesystem::path &rootfs,
+                                  const api::types::v1::RunContextConfig &config) noexcept
+      -> utils::error::Result<void>;
+
     ocppi::cli::CLI &cli;
 };
 
-}; // namespace linglong::runtime
-
-#endif
+} // namespace linglong::runtime

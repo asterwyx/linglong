@@ -2,6 +2,16 @@
   "$schema": "http://json-schema.org/draft-04/schema#",
   "description": "Types used as v1 API of linglong D-Bus service, configuration files and CLI output. The top level type is a place holder to make quicktype work.",
   "$defs": {
+    "InspectResult": {
+      "description": "the result of inspecting a container",
+      "type": "object",
+      "properties": {
+        "appID": {
+          "type": "string",
+          "description": "appID of container"
+        }
+      }
+    },
     "ApplicationConfiguration": {
       "title": "ApplicationConfiguration",
       "description": "application configuration",
@@ -19,11 +29,35 @@
         }
       }
     },
+    "XDGDirectoryPermissions": {
+      "title": "XDGDirectoryPermissions",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "allowed",
+          "dirType"
+        ],
+        "properties": {
+          "allowed": {
+            "type": "boolean",
+            "description": "whether the xdg dir is allowed"
+          },
+          "dirType": {
+            "type": "string",
+            "description": "type of xdg dir, could be one of [Desktop, Downloads, Documents, Music, Pictures, Videos]"
+          }
+        }
+      }
+    },
     "ApplicationConfigurationPermissions": {
       "title": "ApplicationConfigurationPermissions",
       "description": "application configuration permissions",
       "type": "object",
       "properties": {
+        "xdgDirectories": {
+          "$ref": "#/$defs/XDGDirectoryPermissions"
+        },
         "binds": {
           "type": "array",
           "items": {
@@ -68,6 +102,75 @@
               }
             }
           }
+        }
+      }
+    },
+    "ContainerProcessStateInfo": {
+      "description": "information about process which in container that start by ll-cli, all content\nwill write to /run/linglong/UID/PID\n",
+      "type": "object",
+      "required": [
+        "containerID",
+        "app",
+        "base"
+      ],
+      "properties": {
+        "containerID": {
+          "type": "string"
+        },
+        "app": {
+          "type": "string"
+        },
+        "base": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "description": "extensions of container",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "InteractionRequest": {
+      "description": "structured message which inspired by freedesktop Notification Spec.\nrefer: https://specifications.freedesktop.org/notification-spec/latest/protocol.html#id-1.10.3.3.4\n",
+      "type": "object",
+      "required": [
+        "appName",
+        "summary",
+        "timeout"
+      ],
+      "properties": {
+        "appName": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout": {
+          "type": "integer"
+        }
+      }
+    },
+    "InteractionReply": {
+      "description": "message from user reply",
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "choice which in requested actions",
+          "type": "string"
         }
       }
     },
@@ -130,6 +233,10 @@
           "type": "string",
           "const": "1"
         },
+        "onlyApp": {
+          "description": "whether this UAB file has been exported in only-App mode.",
+          "type": "boolean"
+        },
         "sections": {
           "type": "object",
           "required": [
@@ -187,13 +294,26 @@
       "required": [
         "version",
         "package",
-        "build",
-        "base"
+        "build"
       ],
       "properties": {
         "version": {
           "type": "string",
           "description": "version of build file"
+        },
+        "exclude": {
+          "type": "array",
+          "description": "exclude files during exporting UAB. Every item should be absolute path in container. It could be a directory or a regular file. e.g. - /usr/share/locale (exclude all files which in this directory) - /usr/lib/libavfs.a (exclude one file)",
+          "items": {
+            "type": "string"
+          }
+        },
+        "include": {
+          "type": "array",
+          "description": "include files during exporting UAB. For example, the packer can declare a file/directory (e.g. /usr/share/locale/zh_CN) in the excluded directory (e.g. /usr/share/locale)  to exclude all files in /usr/share/locale except /usr/share/locale/zh_CN.",
+          "items": {
+            "type": "string"
+          }
         },
         "package": {
           "title": "BuilderProjectPackage",
@@ -234,6 +354,31 @@
             "channel": {
               "type": "string",
               "description": "channel of package"
+            },
+            "extension_of": {
+              "type": "string",
+              "description": "extension of whom"
+            },
+            "libs": {
+              "description": "extra ld search path",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "description": "Predefined environment variables when the extension is applied",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "deviceNodes": {
+              "description": "device nodes to be mounted",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DeviceNode"
+              }
             }
           }
         },
@@ -271,6 +416,10 @@
                 "type": "string",
                 "description": "digest of source"
               },
+              "name": {
+                "type": "string",
+                "description": "name of source"
+              },
               "commit": {
                 "type": "string",
                 "description": "commit of source"
@@ -279,9 +428,9 @@
                 "type": "string",
                 "description": "version of source"
               },
-              "name": {
-                "type": "string",
-                "description": "name of source"
+              "submodules": {
+                "type": "boolean",
+                "description": "whether to checkout submodules"
               }
             }
           }
@@ -290,6 +439,33 @@
           "title": "BuilderProjectBuildScript",
           "description": "build script of builder project",
           "type": "string"
+        },
+        "buildext": {
+          "title": "BuilderProjectBuildExt",
+          "description": "build extension for builder project",
+          "type": "object",
+          "properties": {
+            "apt": {
+              "description": "build extension for apt",
+              "type": "object",
+              "properties": {
+                "build_depends": {
+                  "description": "packages to be installed in build environment before build starting",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "depends": {
+                  "description": "packages to be installed in runtime environment",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
         },
         "command": {
           "type": "array",
@@ -302,6 +478,34 @@
           "title": "BuilderProjectStripScript",
           "description": "strip script of builder project",
           "type": "string"
+        },
+        "modules": {
+          "title": "BuilderProjectModules",
+          "description": "Specify how to split application into modules.\n",
+          "type": "array",
+          "items": {
+            "title": "BuilderProjectModules",
+            "description": "items of modules of builder project",
+            "type": "object",
+            "required": [
+              "name",
+              "files"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "module name"
+              },
+              "files": {
+                "type": "array",
+                "description": "module install files",
+                "items": {
+                  "type": "string",
+                  "description": "module install file"
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -320,22 +524,6 @@
         "offline": {
           "type": "boolean",
           "description": "use offline mode when build"
-        },
-        "skip_fetch_source": {
-          "type": "boolean",
-          "description": "skip fetch source when build"
-        },
-        "skip_pull_depend": {
-          "type": "boolean",
-          "description": "skip pull depend when build"
-        },
-        "skip_run_container": {
-          "type": "boolean",
-          "description": "skip run container when build"
-        },
-        "skip_commit_output": {
-          "type": "boolean",
-          "description": "skip commit output when build"
         },
         "arch": {
           "type": "string",
@@ -375,6 +563,68 @@
             "type": "string",
             "description": "additional properties of repos"
           }
+        }
+      }
+    },
+    "RepoConfigV2": {
+      "description": "Configuration file for local linglong repository.",
+      "type": "object",
+      "required": [
+        "version",
+        "defaultRepo",
+        "repos"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "description": "version of repo config"
+        },
+        "defaultRepo": {
+          "type": "string",
+          "description": "default repo of repo config"
+        },
+        "repos": {
+          "type": "array",
+          "description": "repos of repo config",
+          "items": {
+            "$ref": "#/$defs/Repo"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "Repo": {
+      "description": "Configuration for a single repository.",
+      "type": "object",
+      "required": [
+        "name",
+        "url",
+        "priority"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "repo name"
+        },
+        "url": {
+          "type": "string",
+          "description": "repo url"
+        },
+        "alias": {
+          "type": "string",
+          "description": "alias of repo name"
+        },
+        "priority": {
+          "type": "integer",
+          "description": "priority of repo"
+        },
+        "mirror_enabled": {
+          "type": "boolean",
+          "description": "whether mirror is enabled for this repo"
+        },
+        "region": {
+          "type": "string",
+          "description": "region code for mirror selection, e.g. CN, US"
         }
       }
     },
@@ -419,36 +669,26 @@
         }
       }
     },
-    "MinifiedInfo": {
-      "title": "MinifiedInfo",
-      "description": "this is used to associate application with specific dependencies",
-      "type": "object",
-      "required": [
-        "infos"
-      ],
-      "properties": {
-        "infos": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "object",
-            "required": [
-              "appRef",
-              "uuid"
-            ],
-            "properties": {
-              "appRef": {
-                "type": "string",
-                "description": "reference of application"
-              },
-              "uuid": {
-                "type": "string",
-                "description": "uuid of imported uab"
-              }
+    "PackageInfoDisplay": {
+      "title": "PackageInfoDisplay",
+      "description": "this is the each item output of ll-cli list --json",
+      "allOf": [
+        {
+          "$ref": "#/$defs/PackageInfoV2"
+        },
+        {
+          "type": "object",
+          "requested": [
+            "info"
+          ],
+          "properties": {
+            "install_time": {
+              "type": "integer",
+              "description": "package install time"
             }
           }
         }
-      }
+      ]
     },
     "PackageInfoV2": {
       "title": "PackageInfoV2",
@@ -467,6 +707,10 @@
         "base"
       ],
       "properties": {
+        "uuid": {
+          "type": "string",
+          "description": "this property is only used for app which instead from UAB and it should be null in other conditions."
+        },
         "channel": {
           "type": "string",
           "description": "channel of package info"
@@ -527,6 +771,20 @@
         "description": {
           "type": "string",
           "description": "description of package info"
+        },
+        "compatible_version": {
+          "type": "string",
+          "description": "record linyaps package is compatible with linyaps component version"
+        },
+        "extensions": {
+          "type": "array",
+          "description": "description of extension",
+          "items": {
+            "$ref": "#/$defs/ExtensionDefine"
+          }
+        },
+        "ext_impl": {
+          "$ref": "#/$defs/ExtensionImpl"
         }
       }
     },
@@ -535,7 +793,6 @@
       "description": "this is the each item output of ll-cli list --json",
       "type": "object",
       "required": [
-        "channel",
         "appid",
         "module",
         "arch",
@@ -605,15 +862,58 @@
         }
       }
     },
+    "ApplicationPermissionsRequest": {
+      "type": "object",
+      "required": [
+        "appID",
+        "xdgDirectories"
+      ],
+      "properties": {
+        "appID": {
+          "type": "string"
+        },
+        "xdgDirectories": {
+          "$ref": "#/$defs/XDGDirectoryPermissions"
+        }
+      }
+    },
+    "CommonOptions": {
+      "title": "CommonOptions",
+      "description": "this is common option for Install and InstallFromFile",
+      "type": "object",
+      "required": [
+        "skipInteraction",
+        "force"
+      ],
+      "properties": {
+        "skipInteraction": {
+          "description": "skip interaction, such as 'apt install aa -y'",
+          "type": "boolean"
+        },
+        "force": {
+          "description": "force to overwrite",
+          "type": "boolean"
+        },
+        "noAutoPrune": {
+          "description": "do not automatically remove unused dependencies",
+          "type": "boolean"
+        }
+      }
+    },
     "CommonResult": {
       "title": "CommonResult",
       "description": "this is common error result of ll-cli command --json",
       "type": "object",
       "required": [
         "message",
-        "code"
+        "code",
+        "type"
       ],
       "properties": {
+        "type": {
+          "description": "error type, to indicate client what should be done.",
+          "type": "string"
+        },
         "message": {
           "description": "Human readable result message.",
           "type": "string"
@@ -624,6 +924,66 @@
         }
       }
     },
+    "InteractionMessageType": {
+      "description": "To identify what message to print during interaction.",
+      "enum": [
+        "Unknown",
+        "Install",
+        "Uninstall",
+        "Upgrade",
+        "Downgrade"
+      ]
+    },
+    "PackageManager1RequestInteractionAdditionalMessage": {
+      "type": "object",
+      "description": "fill ref string to additional message in requestInteraction",
+      "required": [
+        "LocalRef",
+        "RemoteRef"
+      ],
+      "properties": {
+        "LocalRef": {
+          "type": "string"
+        },
+        "RemoteRef": {
+          "type": "string"
+        }
+      }
+    },
+    "State": {
+      "description": "main state of current task,",
+      "enum": [
+        "Unknown",
+        "Queued",
+        "Pending",
+        "Processing",
+        "Succeed",
+        "Failed",
+        "Canceled"
+      ]
+    },
+    "TaskState": {
+      "description": "complete state information of a task",
+      "type": "object",
+      "required": [
+        "state",
+        "progress",
+        "message"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "progress": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
     "PackageManager1InstallLayerFDResult": {
       "$ref": "#/$defs/CommonResult"
     },
@@ -631,26 +991,54 @@
       "type": "object",
       "description": "package manager install parameters",
       "required": [
-        "package"
+        "package",
+        "options"
       ],
       "properties": {
         "package": {
-          "$ref": "#/$defs/PackageManager1Package"
+          "title": "PackageManager1InstallParametersPacakge",
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "modules": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "repo": {
+          "type": "string",
+          "description": "repo alias of package manager install parameters"
+        },
+        "options": {
+          "$ref": "#/$defs/CommonOptions"
         }
       }
     },
-    "PackageManager1InstallResult": {
-      "title": "PackageManager1ResultWithTaskID",
-      "description": "package manager install result",
+    "PackageManager1PackageTaskResult": {
+      "description": "package manager task result",
       "allOf": [
         {
           "$ref": "#/$defs/CommonResult"
         }
       ],
       "properties": {
-        "taskID": {
+        "taskObjectPath": {
           "type": "string",
-          "description": "task id of package manager install"
+          "description": "task dbus object path of package manager install"
         }
       }
     },
@@ -658,22 +1046,24 @@
       "type": "object",
       "description": "package manager uninstall parameters",
       "required": [
-        "package"
+        "package",
+        "options"
       ],
       "properties": {
         "package": {
           "$ref": "#/$defs/PackageManager1Package"
+        },
+        "options": {
+          "$ref": "#/$defs/CommonOptions"
         }
       }
-    },
-    "PackageManager1UninstallResult": {
-      "$ref": "#/$defs/CommonResult"
     },
     "PackageManager1UpdateParameters": {
       "type": "object",
       "description": "package manager update result",
       "required": [
-        "packages"
+        "packages",
+        "depsOnly"
       ],
       "properties": {
         "packages": {
@@ -682,13 +1072,16 @@
           "items": {
             "$ref": "#/$defs/PackageManager1Package"
           }
+        },
+        "depsOnly": {
+          "type": "boolean",
+          "description": "upgrade dependencies only"
+        },
+        "noAutoPrune": {
+          "type": "boolean",
+          "description": "do not automatically remove unused dependencies"
         }
       }
-    },
-    "PackageManager1UpdateResult": {
-      "title": "PackageManager1UpdateResult",
-      "description": "package manager update result",
-      "$ref": "#/$defs/PackageManager1InstallResult"
     },
     "PackageManager1ModifyRepoParameters": {
       "type": "object",
@@ -717,16 +1110,63 @@
       "type": "object",
       "description": "package manager search parameters",
       "required": [
-        "id"
+        "id",
+        "repos"
       ],
       "properties": {
         "id": {
           "type": "string",
           "description": "id of package manager search"
+        },
+        "repos": {
+          "type": "array",
+          "description": "repo of package manager search",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PackageManager1JobInfo": {
+      "type": "object",
+      "description": "Get the job result using an ID",
+      "allOf": [
+        {
+          "$ref": "#/$defs/CommonResult"
+        }
+      ],
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "id of job info"
         }
       }
     },
     "PackageManager1SearchResult": {
+      "type": "object",
+      "description": "result of package manager search",
+      "allOf": [
+        {
+          "$ref": "#/$defs/CommonResult"
+        }
+      ],
+      "properties": {
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PackageInfoV2"
+            },
+            "description": "package info of package manager search"
+          }
+        }
+      }
+    },
+    "PackageManager1PruneResult": {
       "type": "object",
       "description": "result of package manager search",
       "allOf": [
@@ -779,15 +1219,454 @@
           ]
         }
       }
+    },
+    "RepositoryCache": {
+      "title": "RepositoryCache",
+      "type": "object",
+      "description": "storing information of all packages and config of repo",
+      "required": [
+        "version",
+        "ll-version",
+        "config",
+        "layers"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "version of storage"
+        },
+        "ll-version": {
+          "type": "string",
+          "description": "version of linglong at the time of generating the file"
+        },
+        "config": {
+          "$ref": "#/$defs/RepoConfigV2"
+        },
+        "layers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "stores the full module name with repo name and the corresponding ostree commit",
+            "title": "RepositoryCacheLayersItem",
+            "required": [
+              "repo",
+              "commit",
+              "info"
+            ],
+            "properties": {
+              "repo": {
+                "type": "string",
+                "description": "which repo is this app belongs to"
+              },
+              "deleted": {
+                "description": "deleted mark",
+                "type": "boolean"
+              },
+              "commit": {
+                "type": "string",
+                "description": "ostree commit hash"
+              },
+              "info": {
+                "$ref": "#/$defs/PackageInfoV2"
+              }
+            }
+          }
+        },
+        "merged": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Merge multiple modules into one directory",
+            "title": "RepositoryCacheMergedItem",
+            "required": [
+              "id",
+              "modules",
+              "commits"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "binary module ostree commit hash"
+              },
+              "name": {
+                "type": "string",
+                "description": "human readable name"
+              },
+              "binaryCommit": {
+                "type": "string",
+                "description": "binary module ostree commit hash"
+              },
+              "modules": {
+                "type": "array",
+                "description": "list of merged module names",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "commits": {
+                "type": "array",
+                "description": "list of ostree commit hashes for each module",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "UpgradeListResult": {
+      "title": "UpgradeListResult",
+      "description": "this is upgrade list result of ll-cli upgrade --json",
+      "type": "object",
+      "required": [
+        "id",
+        "old_version",
+        "new_version"
+      ],
+      "properties": {
+        "id": {
+          "description": "id of package.",
+          "type": "string"
+        },
+        "old_version": {
+          "description": "version of current installed.",
+          "type": "string"
+        },
+        "new_version": {
+          "description": "version of latest version in remote repo.",
+          "type": "string"
+        }
+      }
+    },
+    "DialogMessage": {
+      "description": "For interactive with frontend dialog. All message exchange between dialog and\ncaller should use stdin and stdout. The first four bytes indicate the length\nof the message. The rest of the payload is the actual payload.\n",
+      "type": "object",
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "description": "type of dialog message, possible values are ['Handshake', 'Request']",
+          "type": "string"
+        },
+        "payload": {
+          "description": "payload of dialog message, the real payload depends on type",
+          "type": "string"
+        }
+      }
+    },
+    "DialogHandShakePayload": {
+      "type": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "description": "Minimum protocol version supported by the client.\nCurrent version is 1.0.\n1.0 behavior: dialog MUST report self minimal protocol version at program start.\n    if client not reported protocol version, caller SHOULD kill dialog after timeout.\n    then, caller will send a directory permission request to dialog. if timeout,\n    client SHOULD exit immediately. after that, caller will wait for dialog exit\n    and use dialog exit code to know user allow the request or not. dialog MUST exit\n    with 0, any other value means user reject the request or dialog internal error and\n    dialog could output any message to stderr.\n",
+          "type": "string"
+        }
+      }
+    },
+    "ExportDirs": {
+      "type": "object",
+      "required": [
+        "export-paths"
+      ],
+      "properties": {
+        "export-paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "path to export"
+          }
+        }
+      }
+    },
+    "ExtensionDefine": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "directory"
+      ],
+      "properties": {
+        "name": {
+          "description": "extension name",
+          "type": "string"
+        },
+        "version": {
+          "description": "extension version",
+          "type": "string"
+        },
+        "directory": {
+          "description": "where extension to be mount",
+          "type": "string"
+        },
+        "allow_env": {
+          "description": "the environment variables allow extension to modify",
+          "type": "object",
+          "additionalProperties": {
+            "description": "default environment variable",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ExtensionImpl": {
+      "type": "object",
+      "properties": {
+        "libs": {
+          "description": "extra ld search path",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "description": "environment variables to set when extension effects",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "deviceNodes": {
+          "description": "device nodes to be mounted",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceNode"
+          }
+        }
+      }
+    },
+    "DeviceNode": {
+      "title": "DeviceNode",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "device node path",
+          "type": "string"
+        },
+        "hostPath": {
+          "description": "host device node path",
+          "type": "string"
+        }
+      }
+    },
+    "RuntimeConfigure": {
+      "title": "RuntimeConfigure",
+      "type": "object",
+      "properties": {
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "ext_defs": {
+          "description": "external extension definitions to extend the component",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/ExtensionDefine"
+            }
+          }
+        },
+        "device_mode": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceOption"
+          }
+        },
+        "disable_xdp": {
+          "type": "boolean"
+        },
+        "enable_pipewire": {
+          "type": "boolean"
+        },
+        "enable_atspi": {
+          "type": "boolean"
+        },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mount"
+          }
+        },
+        "instances": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RuntimeConfigure"
+          }
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "RunContextConfig": {
+      "title": "RunContextConfig",
+      "type": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "base": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "app": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "overlayfs": {
+          "type": "string"
+        },
+        "resolvConf": {
+          "type": "string"
+        },
+        "timezone": {
+          "type": "string"
+        },
+        "cdiDevices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CDIDeviceEntry"
+          }
+        },
+        "instance": {
+          "type": "string"
+        },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mount"
+          }
+        },
+        "hostDynamic": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mount"
+          }
+        }
+      }
+    },
+    "CDIDeviceEntry": {
+      "title": "CDIDeviceEntry",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "spec"
+      ],
+      "properties": {
+        "kind": {
+          "description": "CDI device kind which uniquely identifies the device vendor",
+          "type": "string"
+        },
+        "name": {
+          "description": "CDI device name",
+          "type": "string"
+        },
+        "spec": {
+          "title": "CDISpec",
+          "type": "object",
+          "description": "CDI device spec",
+          "required": [
+            "path",
+            "checksum"
+          ],
+          "properties": {
+            "path": {
+              "description": "CDI device spec path",
+              "type": "string"
+            },
+            "checksum": {
+              "description": "CDI device spec checksum",
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "DeviceOption": {
+      "description": "device option",
+      "enum": [
+        "passthru"
+      ]
+    },
+    "Mount": {
+      "type": "object",
+      "required": [
+        "destination",
+        "source",
+        "type"
+      ],
+      "properties": {
+        "destination": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "src_type": {
+          "type": "string"
+        }
+      }
     }
   },
   "type": "object",
   "properties": {
+    "InspectResult": {
+      "$ref": "#/$defs/InspectResult"
+    },
     "ApplicationConfiguration": {
       "$ref": "#/$defs/ApplicationConfiguration"
     },
+    "XDGDirectoryPermissions": {
+      "$ref": "#/$defs/XDGDirectoryPermissions"
+    },
     "ApplicationConfigurationPermissions": {
       "$ref": "#/$defs/ApplicationConfigurationPermissions"
+    },
+    "ContainerProcessStateInfo": {
+      "$ref": "#/$defs/ContainerProcessStateInfo"
+    },
+    "InteractionRequest": {
+      "$ref": "#/$defs/InteractionRequest"
+    },
+    "InteractionReply": {
+      "$ref": "#/$defs/InteractionReply"
     },
     "OCIConfigurationPatch": {
       "$ref": "#/$defs/OCIConfigurationPatch"
@@ -807,14 +1686,20 @@
     "RepoConfig": {
       "$ref": "#/$defs/RepoConfig"
     },
+    "RepoConfigV2": {
+      "$ref": "#/$defs/RepoConfigV2"
+    },
+    "Repo": {
+      "$ref": "#/$defs/Repo"
+    },
     "LayerInfo": {
       "$ref": "#/$defs/LayerInfo"
     },
     "PackageManager1Package": {
       "$ref": "#/$defs/PackageManager1Package"
     },
-    "MinifiedInfo": {
-      "$ref": "#/$defs/MinifiedInfo"
+    "PackageInfoDisplay": {
+      "$ref": "#/$defs/PackageInfoDisplay"
     },
     "PackageInfoV2": {
       "$ref": "#/$defs/PackageInfoV2"
@@ -822,8 +1707,26 @@
     "PackageInfo": {
       "$ref": "#/$defs/PackageInfo"
     },
+    "ApplicationPermissionsRequest": {
+      "$ref": "#/$defs/ApplicationPermissionsRequest"
+    },
+    "CommonOptions": {
+      "$ref": "#/$defs/CommonOptions"
+    },
     "CommonResult": {
       "$ref": "#/$defs/CommonResult"
+    },
+    "InteractionMessageType": {
+      "$ref": "#/$defs/InteractionMessageType"
+    },
+    "PackageManager1RequestInteractionAdditionalMessage": {
+      "$ref": "#/$defs/PackageManager1RequestInteractionAdditionalMessage"
+    },
+    "State": {
+      "$ref": "#/$defs/State"
+    },
+    "TaskState": {
+      "$ref": "#/$defs/TaskState"
     },
     "PackageManager1InstallLayerFDResult": {
       "$ref": "#/$defs/PackageManager1InstallLayerFDResult"
@@ -831,20 +1734,14 @@
     "PackageManager1InstallParameters": {
       "$ref": "#/$defs/PackageManager1InstallParameters"
     },
-    "PackageManager1InstallResult": {
-      "$ref": "#/$defs/PackageManager1InstallResult"
+    "PackageManager1PackageTaskResult": {
+      "$ref": "#/$defs/PackageManager1PackageTaskResult"
     },
     "PackageManager1UninstallParameters": {
       "$ref": "#/$defs/PackageManager1UninstallParameters"
     },
-    "PackageManager1UninstallResult": {
-      "$ref": "#/$defs/PackageManager1UninstallResult"
-    },
     "PackageManager1UpdateParameters": {
       "$ref": "#/$defs/PackageManager1UpdateParameters"
-    },
-    "PackageManager1UpdateResult": {
-      "$ref": "#/$defs/PackageManager1UpdateResult"
     },
     "PackageManager1ModifyRepoParameters": {
       "$ref": "#/$defs/PackageManager1ModifyRepoParameters"
@@ -855,11 +1752,56 @@
     "PackageManager1SearchParameters": {
       "$ref": "#/$defs/PackageManager1SearchParameters"
     },
+    "PackageManager1JobInfo": {
+      "$ref": "#/$defs/PackageManager1JobInfo"
+    },
     "PackageManager1SearchResult": {
       "$ref": "#/$defs/PackageManager1SearchResult"
     },
+    "PackageManager1PruneResult": {
+      "$ref": "#/$defs/PackageManager1PruneResult"
+    },
     "PackageManager1GetRepoInfoResult": {
       "$ref": "#/$defs/PackageManager1GetRepoInfoResult"
+    },
+    "RepositoryCache": {
+      "$ref": "#/$defs/RepositoryCache"
+    },
+    "UpgradeListResult": {
+      "$ref": "#/$defs/UpgradeListResult"
+    },
+    "DialogMessage": {
+      "$ref": "#/$defs/DialogMessage"
+    },
+    "DialogHandShakePayload": {
+      "$ref": "#/$defs/DialogHandShakePayload"
+    },
+    "ExportDirs": {
+      "$ref": "#/$defs/ExportDirs"
+    },
+    "ExtensionDefine": {
+      "$ref": "#/$defs/ExtensionDefine"
+    },
+    "ExtensionImpl": {
+      "$ref": "#/$defs/ExtensionImpl"
+    },
+    "DeviceNode": {
+      "$ref": "#/$defs/DeviceNode"
+    },
+    "RuntimeConfigure": {
+      "$ref": "#/$defs/RuntimeConfigure"
+    },
+    "RunContextConfig": {
+      "$ref": "#/$defs/RunContextConfig"
+    },
+    "CDIDeviceEntry": {
+      "$ref": "#/$defs/CDIDeviceEntry"
+    },
+    "DeviceOption": {
+      "$ref": "#/$defs/DeviceOption"
+    },
+    "Mount": {
+      "$ref": "#/$defs/Mount"
     }
   }
 }

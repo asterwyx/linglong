@@ -1,0 +1,65 @@
+// SPDX-FileCopyrightText: 2025 - 2026 UnionTech Software Technology Co., Ltd.
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+#pragma once
+
+#include "linglong/utils/error/error.h"
+
+namespace linglong::generator {
+class ContainerCfgBuilder;
+}
+
+namespace linglong::runtime {
+
+class ContainerContext;
+class RunContext;
+
+enum class SecurityContextType : uint8_t {
+    WAYLAND,
+    UNKNOWN,
+};
+
+std::string fromType(SecurityContextType type) noexcept;
+SecurityContextType toType(const std::string &type) noexcept;
+
+class SecurityContext
+{
+    friend class SecurityContextManager;
+
+public:
+    virtual ~SecurityContext() = default;
+    SecurityContext(const SecurityContext &) = delete;
+    SecurityContext &operator=(const SecurityContext &) = delete;
+    SecurityContext(SecurityContext &&other) noexcept = default;
+    SecurityContext &operator=(SecurityContext &&other) noexcept = default;
+
+    virtual linglong::utils::error::Result<void> apply(generator::ContainerCfgBuilder &builder) = 0;
+    virtual SecurityContextType type() noexcept = 0;
+
+protected:
+    SecurityContext() = default;
+};
+
+class SecurityContextManager
+{
+public:
+    virtual ~SecurityContextManager() = default;
+    SecurityContextManager(const SecurityContextManager &) = delete;
+    SecurityContextManager &operator=(const SecurityContextManager &) = delete;
+    SecurityContextManager(SecurityContextManager &&other) noexcept = default;
+    SecurityContextManager &operator=(SecurityContextManager &&other) noexcept = default;
+
+    virtual linglong::utils::error::Result<std::unique_ptr<SecurityContext>>
+    createSecurityContext(RunContext &runContext, ContainerContext &containerContext) = 0;
+
+protected:
+    SecurityContextManager() = default;
+};
+
+std::vector<SecurityContextType> &getDefaultSecurityContexts() noexcept;
+
+std::unique_ptr<SecurityContextManager>
+getSecurityContextManager(SecurityContextType type) noexcept;
+
+} // namespace linglong::runtime

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+# SPDX-FileCopyrightText: 2023 - 2026 UnionTech Software Technology Co., Ltd.
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
@@ -18,9 +18,12 @@ QUICKTYPE=${QUICKTYPE:=$(command -v quicktype || true)}
 
 if [ -z "$QUICKTYPE" ]; then
         pushd quicktype
-        if not npx quicktype --version &>/dev/null; then
+        if ! npx quicktype --version &>/dev/null; then
+                echo "Installing quicktype"
                 npm i
                 npm run build
+        else
+                echo "quicktype already installed"
         fi
         popd
 fi
@@ -109,6 +112,11 @@ generate() {
 # yq should use which written in go instead of python. https://github.com/mikefarah/yq
 YQ=${YQ:=$(command -v yq)}
 
+if [ -z "$YQ" ]; then
+        echo "yq not found"
+        exit 255
+fi
+
 "$YQ" e '.properties = ( [
         .$defs | keys | .[] as $type | {
                 "key" : $type,
@@ -126,3 +134,11 @@ generate \
         "linglong::api::types::v1" \
         "/libs/api/src/" \
         "linglong/api/types/v1"
+
+rm -f "$repoRoot/libs/cdi/src/linglong/cdi/types/*"
+generate \
+        "$repoRoot/libs/cdi/schema.json" \
+        CDI \
+        "linglong::cdi::types" \
+        "/libs/cdi/src/" \
+        "linglong/cdi/types"

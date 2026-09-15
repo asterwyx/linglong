@@ -1,26 +1,181 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_CLI_CLI_H_
-#define LINGLONG_CLI_CLI_H_
+#pragma once
 
 #include "linglong/api/dbus/v1/package_manager.h"
+#include "linglong/api/dbus/v1/task.h"
+#include "linglong/api/types/v1/CommonOptions.hpp"
+#include "linglong/api/types/v1/PackageInfoDisplay.hpp"
+#include "linglong/cli/interactive_notifier.h"
 #include "linglong/cli/printer.h"
+#include "linglong/common/cli/repo.h"
+#include "linglong/common/serialize/json.h"
 #include "linglong/repo/ostree_repo.h"
 #include "linglong/runtime/container_builder.h"
+#include "linglong/utils/error/error.h"
+#include "linglong/utils/log/log.h"
 
-#include <docopt.h>
+#include <CLI/CLI.hpp>
 
-#include <QCommandLineOption>
-#include <QCommandLineParser>
-#include <QCoreApplication>
+namespace linglong::runtime {
+class RunContext;
+}
 
-#include <csignal>
+namespace linglong::generator {
+class ContainerCfgBuilder;
+}
+
+namespace linglong::api::types::v1 {
+struct PackageManager1InstallParameters;
+}
 
 namespace linglong::cli {
+
+class Printer;
+
+// 全局选项（仅用于verbose等通用选项）
+struct GlobalOptions
+{
+    int verbose{ 0 };
+    bool noProgress{ false };
+};
+
+// 各subcommand的独立选项结构体
+struct RunOptions
+{
+    std::string appid;
+    std::optional<std::string> runContext;
+    std::vector<std::string> filePaths;
+    std::vector<std::string> fileUrls;
+    std::vector<std::string> envs;
+    std::vector<std::string> commands;
+    std::optional<std::string> base;
+    std::optional<std::string> runtime;
+    std::optional<std::string> workdir;
+    std::vector<std::string> extensions;
+    std::optional<bool> disableXdp;
+    std::optional<bool> enablePipewireSocketMount;
+    std::optional<bool> enableAtSpiSocketMount;
+    bool privileged{ false };
+    std::vector<std::string> capsAdd;
+    std::vector<std::string> cdiSpecDir = { "/etc/linglong/cdi", "/etc/cdi", "/var/run/cdi" };
+    std::vector<std::string> cdiDevices;
+    std::vector<api::types::v1::DeviceOption> deviceOptions;
+    std::optional<std::string> instance;
+    bool debug{ false };
+    std::string debugListen{ "127.0.0.1:2345" };
+    std::optional<std::string> debugDebuginfod;
+    std::optional<std::string> debugSymbolDir;
+};
+
+struct EnterOptions
+{
+    std::string instance;
+    std::string workDir;
+    std::vector<std::string> commands;
+};
+
+struct KillOptions
+{
+    std::string appid;
+    std::string signal{ "SIGTERM" };
+};
+
+struct PsOptions
+{
+    bool noTruncate{ false };
+};
+
+struct InstallOptions
+{
+    std::string appid;
+    std::string module;
+    std::optional<std::string> repo;
+    bool forceOpt{ false };
+    bool confirmOpt{ false };
+    bool noAutoPrune{ false };
+};
+
+struct UpgradeOptions
+{
+    std::string appid; // 可选，为空时升级所有应用
+    bool depsOnly{ false };
+    bool noAutoPrune{ false };
+};
+
+struct SearchOptions
+{
+    std::string appid; // 用作关键词
+    std::string type{ "all" };
+    std::optional<std::string> repo;
+    bool showDevel{ false };
+    bool showAllVersion{ false };
+};
+
+struct UninstallOptions
+{
+    std::string appid;
+    std::string module;
+    bool forceOpt{ false };
+    bool noAutoPrune{ false };
+};
+
+struct ListOptions
+{
+    std::string type{ "all" };
+    bool showUpgradeList{ false };
+};
+
+struct SizeOptions
+{
+    std::string sortBy{ "actual" };
+    bool ascending{ false };
+};
+
+struct DependsOptions
+{
+    std::string appid;
+};
+
+struct InfoOptions
+{
+    std::string appid;
+};
+
+struct ContentOptions
+{
+    std::string appid;
+};
+
+struct InspectOptions
+{
+    std::string appid;
+    std::string module;
+    std::string dirType{ "layer" };
+};
+
+enum class TaskType : int {
+    None,
+    Install,
+    InstallFromFile,
+    Search,
+    Uninstall,
+    Upgrade,
+};
+
+struct PMTaskState
+{
+    linglong::api::types::v1::State state{ linglong::api::types::v1::State::Unknown };
+    TaskType taskType{ TaskType::None };
+    std::variant<api::types::v1::PackageManager1InstallParameters, SearchOptions> params;
+};
+
+bool operator!=(const PMTaskState &lhs, const PMTaskState &rhs);
+bool operator==(const PMTaskState &lhs, const PMTaskState &rhs);
 
 class Cli : public QObject
 {
@@ -32,56 +187,135 @@ public:
     Cli &operator=(Cli &&) = delete;
     ~Cli() override = default;
     Cli(Printer &printer,
-        ocppi::cli::CLI &cli,
-        runtime::ContainerBuilder &containerBuidler,
-        api::dbus::v1::PackageManager &pkgMan,
-        repo::OSTreeRepo &repo,
+        ocppi::cli::CLI &ociCLI,
+        runtime::ContainerBuilder &containerBuilder,
+        bool peerMode,
+        std::unique_ptr<InteractiveNotifier> &&notifier,
         QObject *parent = nullptr);
 
-    static const char USAGE[];
+    int run(const RunOptions &options);
+    int runWithContext(const RunOptions &options);
+    int enter(const EnterOptions &options);
+    int ps(const PsOptions &options);
+    int kill(const KillOptions &options);
+    int install(const InstallOptions &options);
+    int upgrade(const UpgradeOptions &options);
+    int search(const SearchOptions &options);
+    int uninstall(const UninstallOptions &options);
+    int list(const ListOptions &options);
+    int size(const SizeOptions &options);
+    int depends(const DependsOptions &options);
+    int repo(CLI::App *subcommand, const common::cli::RepoOptions &options);
+    int info(const InfoOptions &options);
+    int content(const ContentOptions &options);
+    int prune();
+    int inspect(CLI::App *subcommand, const InspectOptions &options);
+
+    void cancelCurrentTask();
+
+    void setGlobalOptions(const GlobalOptions &options) noexcept { this->globalOptions = options; }
+
+protected:
+    virtual utils::error::Result<repo::OSTreeRepo *> getRepo(bool forceReload = false) noexcept;
+    virtual utils::error::Result<std::unique_ptr<repo::OSTreeRepo>>
+    loadRepoFromPath(const std::filesystem::path &repoRoot) noexcept;
+    virtual utils::error::Result<void> initializeRepo() noexcept;
+    virtual utils::error::Result<api::dbus::v1::PackageManager *> getPkgMan();
+    virtual utils::error::Result<std::unique_ptr<api::dbus::v1::PackageManager>>
+    initializePeerModePackageManager();
+    virtual utils::error::Result<std::unique_ptr<api::dbus::v1::PackageManager>>
+    initializeDBusPackageManager();
+
+private:
+    [[nodiscard]] static utils::error::Result<void>
+    RequestDirectories(const api::types::v1::PackageInfoV2 &info) noexcept;
+    [[nodiscard]] std::vector<std::string> filePathMapping(
+      const std::vector<std::string> &command, const RunOptions &options) const noexcept;
+    static std::string mappingFile(const std::filesystem::path &file) noexcept;
+    static std::string mappingUrl(std::string_view url) noexcept;
+
+    static void filterPackageInfosByType(
+      std::map<std::string, std::vector<api::types::v1::PackageInfoV2>> &list,
+      const std::string &type) noexcept;
+    static void filterPackageInfosByType(std::vector<api::types::v1::PackageInfoDisplay> &list,
+                                         const std::string &type);
+    static void filterPackageInfosByVersion(
+      std::map<std::string, std::vector<api::types::v1::PackageInfoV2>> &list) noexcept;
+    [[nodiscard]] utils::error::Result<std::vector<api::types::v1::CliContainer>>
+    getCurrentContainers() const noexcept;
+    utils::error::Result<int> reuseContainer(const std::string &id,
+                                             const std::vector<std::string> &command) noexcept;
+    int installFromFile(const QFileInfo &fileInfo,
+                        const api::types::v1::CommonOptions &commonOptions);
+    int setRepoConfig(const QVariantMap &config);
+    utils::error::Result<std::vector<api::types::v1::UpgradeListResult>> listUpgradable();
+    utils::error::Result<std::filesystem::path> ensureCache(runtime::RunContext &context) noexcept;
+    void updateAM() noexcept;
+    utils::error::Result<std::vector<std::string>> getRunningAppContainers(const std::string &id);
+    bool isContainerIDMatch(const std::string &containerID, const std::string &shortID);
+    utils::error::Result<void> ensureBaseDevelopModule(runtime::RunContext &runContext);
+    int getLayerDir(const InspectOptions &options);
+    int getBundleDir(const InspectOptions &options);
+    void detectDrivers();
+    int runResolvedContext(runtime::RunContext &runContext,
+                           const RunOptions &options,
+                           std::optional<api::types::v1::RuntimeConfigure> runtimeConfig);
+
+    template <typename T>
+    utils::error::Result<T> waitDBusReply(QDBusPendingReply<QVariantMap> &reply)
+    {
+        LINGLONG_TRACE("waitDBusReply");
+
+        reply.waitForFinished();
+        if (reply.isError()) {
+            return LINGLONG_ERR(reply.error().message().toStdString(), reply.error().type());
+        }
+
+        auto result = common::serialize::fromQVariantMap<T>(reply.value());
+        if (!result) {
+            LogF("bug detected: {}", result.error());
+            std::abort();
+        }
+
+        return result;
+    }
+
+    utils::error::Result<void> waitTaskCreated(QDBusPendingReply<QVariantMap> &reply,
+                                               TaskType type);
+    void waitTaskDone();
+
+    void handleInstallError(const utils::error::Error &error,
+                            const api::types::v1::PackageManager1InstallParameters &params);
+    void handleInstallFromFileError(const utils::error::Error &error);
+    void handleUninstallError(const utils::error::Error &error);
+    void handleUpgradeError(const utils::error::Error &error);
+    bool handleCommonError(const utils::error::Error &error);
+    void printOnTaskFailed(const QVariantMap &result);
+    void printOnTaskSuccess(const QVariantMap &result);
+
+private Q_SLOTS:
+    void onTaskEvent(const QString &event, const QVariantMap &data);
+    void onTaskFinished(const QVariantMap &result);
+    void interaction(const QString &interactionId,
+                     int messageID,
+                     const QVariantMap &additionalMessage);
+
+Q_SIGNALS:
+    void taskDone();
 
 private:
     Printer &printer;
     ocppi::cli::CLI &ociCLI;
     runtime::ContainerBuilder &containerBuilder;
-    repo::OSTreeRepo &repository;
-    api::dbus::v1::PackageManager &pkgMan;
-    QString taskID;
-    bool taskDone{ true };
-    service::InstallTask::Status lastStatus;
-    std::vector<std::string>
-    filePathMapping(std::map<std::string, docopt::value> &args,
-                    const std::vector<std::string> &command) const noexcept;
-    static void filterPackageInfosFromType(std::vector<api::types::v1::PackageInfoV2> &list,
-                                           const QString &type) noexcept;
-    void updateAM() noexcept;
-    [[nodiscard]] utils::error::Result<package::LayerDir> getDependLayerDir(
-      const package::Reference &appRef, const package::Reference &ref) const noexcept;
-
-public:
-    int run(std::map<std::string, docopt::value> &args);
-    int exec(std::map<std::string, docopt::value> &args);
-    int enter(std::map<std::string, docopt::value> &args);
-    int ps(std::map<std::string, docopt::value> &args);
-    int kill(std::map<std::string, docopt::value> &args);
-    int install(std::map<std::string, docopt::value> &args);
-    int upgrade(std::map<std::string, docopt::value> &args);
-    int search(std::map<std::string, docopt::value> &args);
-    int uninstall(std::map<std::string, docopt::value> &args);
-    int list(std::map<std::string, docopt::value> &args);
-    int repo(std::map<std::string, docopt::value> &args);
-    int info(std::map<std::string, docopt::value> &args);
-    int content(std::map<std::string, docopt::value> &args);
-
-    void cancelCurrentTask();
-
-private Q_SLOTS:
-    int installFromFile(const QFileInfo &fileInfo);
-    void processDownloadStatus(const QString &recTaskID,
-                               const QString &percentage,
-                               const QString &message,
-                               int status);
+    std::unique_ptr<repo::OSTreeRepo> repository;
+    std::unique_ptr<InteractiveNotifier> notifier;
+    bool peerMode{ false };
+    std::unique_ptr<api::dbus::v1::PackageManager> pkgMan;
+    QString taskObjectPath;
+    std::unique_ptr<api::dbus::v1::Task1> task;
+    PMTaskState taskState;
+    bool taskFinished{ false };
+    GlobalOptions globalOptions;
 };
 
 } // namespace linglong::cli
-#endif // LINGLONG_SRC_CLI_CLI_H

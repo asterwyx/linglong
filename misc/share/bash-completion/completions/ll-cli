@@ -1,101 +1,190 @@
 #!/bin/env bash
 
-# SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+# SPDX-FileCopyrightText: 2023 - 2026 UnionTech Software Technology Co., Ltd.
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
 # linglong cli completion
 
-__ll_cli_find_subcommand() {
-        lines=$(ll-cli --help | wc -l)
-        ll-cli --help | grep "Subcommands:" -A $lines | tail -n+2 | awk -F\  '{print $1}' | tr '\n' ' '
-}
+#set -x
 
 __ll_cli_get_container_list() {
-        ll-cli ps | tail -n+2 | awk '{print $1}' | tr '\n' ' '
+    ll-cli ps 2>/dev/null | awk 'NR>1 {print $1}'
+}
+
+__ll_cli_get_installed_app_list() {
+    ll-cli list --type=app 2>/dev/null | awk 'NR>1 {print $1}'
 }
 
 __ll_cli_get_installed_list() {
-        ll-cli list | tail -n+2 | awk '{print $1}' | tr '\n' ' '
-}
-
-__ll_cli_get_app_list() {
-        ll-cli search . | tail -n+2 | awk '{print $1}' | tr '\n' ' '
+    ll-cli list 2>/dev/null | awk 'NR>1 {print $1}'
 }
 
 __ll_cli_get_layer_list() {
-        ls $1* 2>/dev/null | tr '\n' ' '
+    ls -- "${1:-}"*.layer 2>/dev/null | tr '\n' ' '
 }
 
-_ll_cli() {
-        local wordlist
+__ll_cli_get_repo_alias_list() {
+    ll-cli repo show 2>/dev/null | awk 'NR>2 {print $3}'
+}
 
-        common_option="--version --json --help -h"
-        if [[ "${#COMP_WORDS[@]}" == "2" ]]; then
-                wordlist=$(__ll_cli_find_subcommand)
+__filter_exist_options() {
+    local all_candidates=($1)
+    local filtered=()
+    for opt in "${all_candidates[@]}"; do
+        local found=0
+        for word in "${COMP_WORDS[@]}"; do
+            if [[ "$word" == "$opt" ]]; then
+                found=1
+                break
+            fi
+        done
+        # 如果当前选项不在已输入的单词中，则加入候选列表
+        [[ $found -eq 0 ]] && filtered+=("$opt")
+    done
+    echo "${filtered[@]}"
+}
+
+_ll_cli_completion() {
+    local cur prev words cword
+    _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD - 1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local subcommands="run ps enter kill install uninstall upgrade search list analyze repo info content prune"
+    local global_opts="--help --help-all --json --verbose -v --no-progress"
+
+    COMPREPLY=()
+    local subcmd=""
+    local i
+
+    # 查找当前的子命令
+    for ((i = 1; i < cword; i++)); do
+        if [[ " $subcommands " =~ " ${words[i]} " ]]; then
+            subcmd="${words[i]}"
+            break
         fi
-        wordlist="$wordlist $common_option"
+    done
 
-        case "${COMP_WORDS[1]}" in
-        run)
-                run_option="--no-dbus-proxy --dbus-proxy-cfg"
-                wordlist="$wordlist $run_option $(__ll_cli_get_installed_list)"
-                ;;
-        ps)
-                wordlist=$wordlist
-                ;;
-        exec)
-                exec_option="--working-directory"
-                wordlist="$wordlist $exec_option $(__ll_cli_get_container_list)"
-                ;;
-        enter)
-                enter_option="--working-directory"
-                wordlist="$wordlist $enter_option $(__ll_cli_get_container_list)"
-                ;;
-        kill)
-                wordlist="$wordlist $(__ll_cli_get_container_list)"
-                ;;
-        install)
-                install_option="--no-dbus"
-                wordlist="$wordlist $install_option $(__ll_cli_get_app_list) $(__ll_cli_get_layer_list ${COMP_WORDS[2]})"
-                ;;
-        uninstall)
-                uninstall_option="--all --prune"
-                wordlist="$wordlist $uninstall_option $(__ll_cli_get_installed_list)"
-                ;;
-        upgrade)
-                wordlist="$wordlist $(__ll_cli_get_installed_list)"
-                ;;
-        search)
-                search_option="--type"
-                wordlist="$wordlist $search_option $(__ll_cli_get_app_list)"
-                ;;
-        list)
-                list_option="--no-dbus --type"
-                wordlist="$wordlist $list_option"
-                ;;
-        repo)
-                subcommand="modify list"
-                repo_option=""
-                if [[ "${COMP_WORDS[2]}" == "modify" ]]; then
-                        subcommand=""
-                        repo_option="--name"
-                elif [[ "${COMP_WORDS[2]}" == "show" ]]; then
-                        subcommand=""
-                        repo_option=""
-                fi
-                wordlist="$wordlist $subcommand $repo_option"
-                ;;
-        info)
-                wordlist="$wordlist $(__ll_cli_get_installed_list) $(__ll_cli_get_layer_list ${COMP_WORDS[2]})"
-                ;;
-        esac
-
-        local cur=${COMP_WORDS[COMP_CWORD]}
-        COMPREPLY=($(compgen -W "${wordlist}" -- "${cur}"))
-
+    if [[ -z "$subcmd" ]]; then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=($(compgen -W "$global_opts --version" -- "$cur"))
+        else
+            COMPREPLY=($(compgen -W "$subcommands $global_opts --version" -- "$cur"))
+        fi
         return 0
+    fi
+
+    local opts=""
+    case "$subcmd" in
+    run)
+        if [[ "$prev" == "run" && "$cur" != -* ]]; then
+            opts="$(__ll_cli_get_installed_app_list)"
+        else
+            opts="--file --url --env --base --runtime --extensions --workdir"
+            opts+=" --enable-xdp --disable-xdp --enable-pipewire --enable-atspi"
+            opts+=" --cdi-spec-dir --device --device-mode --instance"
+            opts+=" --debug --debug-listen --debug-debuginfod --debug-symbol-dir"
+        fi
+        ;;
+    ps)
+        opts="--no-truncated"
+        ;;
+    enter)
+        if [[ "$prev" == "enter" && "$cur" != -* ]]; then
+            opts="$(__ll_cli_get_container_list)"
+        else
+            opts="--working-directory"
+        fi
+        ;;
+    kill)
+        if [[ "$prev" == "-s" || "$prev" == "--signal" ]]; then
+            opts="SIGTERM SIGKILL SIGINT SIGHUP"
+        elif [[ "$prev" == "kill" && "$cur" != -* ]]; then
+            opts="$(__ll_cli_get_container_list)"
+        else
+            opts="--signal -s"
+        fi
+        ;;
+    install)
+        opts="--module --repo --force -y --no-auto-prune"
+
+        if [[ "$cur" != -* ]]; then
+            _filedir '@(layer|uab)'
+
+            if [[ ${#COMPREPLY[@]} -gt 0 ]]; then
+                local filtered_opts=$(__filter_exist_options "$opts $global_opts")
+                COMPREPLY+=($(compgen -W "$filtered_opts" -- "$cur"))
+                return 0
+            fi
+        fi
+        ;;
+    upgrade)
+        if [[ "$cur" == -* ]]; then
+            opts="--deps-only --no-auto-prune"
+        else
+            opts="$(__ll_cli_get_installed_app_list)"
+        fi
+        ;;
+    uninstall)
+        if [[ "$prev" == "uninstall" && "$cur" != -* ]]; then
+            opts="$(__ll_cli_get_installed_app_list)"
+        else
+            opts="--module --force --no-auto-prune"
+        fi
+        ;;
+    analyze)
+        local analyze_subs="size depends"
+        if [[ "$prev" == "analyze" ]]; then
+            opts="$analyze_subs"
+        elif [[ "$prev" == "size" || "$prev" == "--sort" ]]; then
+            [[ "$prev" == "size" ]] && opts="--sort --asc"
+            [[ "$prev" == "--sort" ]] && opts="actual logical exclusive shared id"
+        elif [[ "$prev" == "depends" ]]; then
+            opts="$(__ll_cli_get_installed_list)"
+        fi
+        ;;
+    search | list)
+        if [[ "$prev" == "--type" ]]; then
+            opts="runtime base app all"
+        else
+            [[ "$subcmd" == "search" ]] && opts="--type --repo --dev --show-all-version"
+            [[ "$subcmd" == "list" ]] && opts="--type --upgradable"
+        fi
+        ;;
+    repo)
+        local repo_subs="add remove update set-default show set-priority enable-mirror disable-mirror"
+        if [[ "$prev" == "repo" ]]; then
+            opts="$repo_subs"
+        elif [[ " ${words[*]} " =~ " enable-mirror " ]]; then
+            opts="--region"
+        elif [[ " remove update set-default set-priority enable-mirror disable-mirror " =~ " $prev " ]]; then
+            opts="$(__ll_cli_get_repo_alias_list)"
+        elif [[ " ${words[*]} " =~ " add " ]]; then
+            opts="--alias"
+        fi
+        ;;
+    info)
+        opts="$(__ll_cli_get_installed_list) $(__ll_cli_get_layer_list ${cur})"
+        ;;
+    content)
+        opts="$(__ll_cli_get_installed_list)"
+        ;;
+    esac
+
+    local total_candidates="$opts $global_opts"
+
+    local final_opts
+    final_opts=$(__filter_exist_options "$total_candidates")
+
+    if [[ -n "$final_opts" ]]; then
+        COMPREPLY=($(compgen -W "$final_opts" -- "$cur"))
+    fi
+
+    return 0
 }
 
-complete -F _ll_cli ll-cli
-complete -F _ll_cli llpkg
+complete -F _ll_cli_completion -o default ll-cli

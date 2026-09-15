@@ -1,54 +1,80 @@
-# SPDX-FileCopyrightText: 2024 UnionTech Software Technology Co., Ltd.
+# SPDX-FileCopyrightText: 2024 - 2026 UnionTech Software Technology Co., Ltd.
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
 set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-find_library(FOUND_erofsfuse_STATIC "erofsfuse")
 
-if("${FOUND_erofsfuse_STATIC}" STREQUAL "")
-  message(SEND_ERROR "liberofsfuse.a not fount, skip uab-header")
+# TODO: if erofsfuse and libdeflate provides .pc file or config.cmake, change it
+# to pkg_search_modules/find_package
+
+find_library(static_liberofsfuse "erofsfuse")
+if("${static_liberofsfuse}" STREQUAL "static_liberofsfuse-NOTFOUND")
+  message(FATAL_ERROR "liberofsfuse.a not found.")
 endif()
 
-get_filename_component(ABS_FILE ${FOUND_erofsfuse_STATIC} ABSOLUTE)
+get_filename_component(EROFSFUSE_ABS_FILE ${static_liberofsfuse} ABSOLUTE)
 message(STATUS "found liberofsfuse.a: ${ABS_FILE}")
 
-find_package(libdeflate REQUIRED COMPONENTS libdeflate_static)
+find_library(static_libdeflate "deflate")
+if("${static_libdeflate}" STREQUAL "static_libdeflate-NOTFOUND")
+  message(FATAL_ERROR "libdeflate.a not found")
+endif()
 
-pkg_search_module(elf_static REQUIRED IMPORTED_TARGET libelf)
+get_filename_component(LIBDEFLATE_ABS_FILE ${static_libdeflate} ABSOLUTE)
+message(STATUS "found libdeflate.a: ${LIBDEFLATE_ABS_FILE}")
+
 pkg_search_module(lz4 REQUIRED IMPORTED_TARGET liblz4)
 pkg_search_module(lzma REQUIRED IMPORTED_TARGET liblzma)
-pkg_search_module(ZLIB REQUIRED IMPORTED_TARGET zlib)
-pkg_search_module(FUSE REQUIRED IMPORTED_TARGET fuse)
+pkg_search_module(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 pkg_search_module(SELINUX REQUIRED IMPORTED_TARGET libselinux)
-pkg_search_module(PCRE2-8 REQUIRED IMPORTED_TARGET libpcre2-8)
-pkg_search_module(CRYPTO REQUIRED IMPORTED_TARGET libcrypto)
 pkg_search_module(ZSTD REQUIRED IMPORTED_TARGET libzstd)
-
-add_link_options(-static -static-libgcc -static-libstdc++)
+pkg_search_module(PCRE2_8 REQUIRED IMPORTED_TARGET libpcre2-8)
 
 pfl_add_executable(
   DISABLE_INSTALL
   SOURCES
   ./src/main.cpp
+  ./src/light_elf.h
+  ./src/utils.h
   OUTPUT_NAME
   uab-header
   LINK_LIBRARIES
   PRIVATE
-  ${ABS_FILE}
   linglong::api
-  PkgConfig::elf_static
+  linglong::utils
+  nlohmann_json::nlohmann_json
+  PkgConfig::SELINUX
+  PkgConfig::ZSTD
   PkgConfig::lz4
   PkgConfig::lzma
-  PkgConfig::ZLIB
-  PkgConfig::FUSE
-  PkgConfig::SELINUX
-  PkgConfig::PCRE2-8
-  PkgConfig::CRYPTO
-  PkgConfig::ZSTD
-  libdeflate::libdeflate_static
-  nlohmann_json::nlohmann_json)
+  PkgConfig::PCRE2_8
+  PkgConfig::FUSE3
+  ${EROFSFUSE_ABS_FILE}
+  ${LIBDEFLATE_ABS_FILE}
+  stdc++fs)
+
+set(UAB_HEADER_TARGET)
+get_real_target_name(UAB_HEADER_TARGET linglong::header)
+
+set(UAB_HEADER_LINKER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/uab-header.ld)
+set_property(
+  TARGET ${UAB_HEADER_TARGET} APPEND
+  PROPERTY LINK_DEPENDS ${UAB_HEADER_LINKER_SCRIPT})
+target_link_options(${UAB_HEADER_TARGET} PRIVATE -static -static-libgcc -static-libstdc++
+                    -Wl,-T,${UAB_HEADER_LINKER_SCRIPT})
+
+if(${AGGRESSIVE_UAB_SIZE})
+  message(STATUS "minify size of uab header aggressively")
+  target_compile_options(
+    ${UAB_HEADER_TARGET} PRIVATE -Os -fno-asynchronous-unwind-tables -fno-rtti
+                                 -fdata-sections -ffunction-sections -flto=auto)
+
+  target_link_options(
+    ${UAB_HEADER_TARGET} PRIVATE
+    -Wl,--gc-sections,--as-needed,--strip-all,--exclude-libs,ALL -flto=auto)
+endif()
 
 include(GNUInstallDirs)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/uab-header
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/linglong/builder/uab)
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/linglong/builder/uab)

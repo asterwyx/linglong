@@ -1,67 +1,172 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_SRC_PACKAGE_MANAGER_PACKAGE_MANAGER_H_
-#define LINGLONG_SRC_PACKAGE_MANAGER_PACKAGE_MANAGER_H_
+#pragma once
 
+#include "linglong/api/types/v1/CommonOptions.hpp"
+#include "linglong/api/types/v1/ContainerProcessStateInfo.hpp"
+#include "linglong/api/types/v1/Repo.hpp"
+#include "linglong/api/types/v1/UabLayer.hpp"
+#include "linglong/package/fuzzy_reference.h"
+#include "linglong/package/reference.h"
 #include "linglong/repo/ostree_repo.h"
-#include "task.h"
+#include "linglong/runtime/container_builder.h"
+#include "linglong/utils/log/log.h"
+#include "package_task.h"
 
 #include <QDBusArgument>
+#include <QDBusConnection>
 #include <QDBusContext>
 #include <QList>
 #include <QObject>
 
+#include <filesystem>
+#include <memory>
+#include <optional>
+
 namespace linglong::service {
+
+class Action;
 
 class PackageManager : public QObject, protected QDBusContext
 {
     Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.deepin.linglong.PackageManager")
-    Q_PROPERTY(QVariantMap Configuration READ getConfiguration WRITE setConfiguration)
+    Q_CLASSINFO("D-Bus Interface", "org.deepin.linglong.PackageManager1")
+    Q_PROPERTY(QVariantMap Configuration READ getConfiguration)
 
 public:
-    PackageManager(linglong::repo::OSTreeRepo &repo, QObject *parent);
+    PackageManager(std::unique_ptr<linglong::repo::OSTreeRepo> repo,
+                   std::unique_ptr<linglong::runtime::ContainerBuilder> containerBuilder,
+                   QObject *parent);
 
-    ~PackageManager() override = default;
+    ~PackageManager() override;
     PackageManager(const PackageManager &) = delete;
     PackageManager(PackageManager &&) = delete;
     auto operator=(const PackageManager &) -> PackageManager & = delete;
     auto operator=(PackageManager &&) -> PackageManager & = delete;
-    void Install(InstallTask &taskContext,
-                 const package::Reference &ref,
-                 bool devel) noexcept;
-    void Update(InstallTask &taskContext,
-                const package::Reference &ref,
-                const package::Reference &newRef,
-                bool develop) noexcept;
 
 public
-    Q_SLOT : auto getConfiguration() const noexcept -> QVariantMap;
-    auto setConfiguration(const QVariantMap &parameters) noexcept -> QVariantMap;
+    Q_SLOT : [[nodiscard]] auto getConfiguration() const noexcept -> QVariantMap;
+    void SetConfiguration(const QVariantMap &parameters) noexcept;
     auto Install(const QVariantMap &parameters) noexcept -> QVariantMap;
     auto InstallFromFile(const QDBusUnixFileDescriptor &fd,
-                         const QString &fileType) noexcept -> QVariantMap;
+                         const QString &fileType,
+                         const QVariantMap &options) noexcept -> QVariantMap;
     auto Uninstall(const QVariantMap &parameters) noexcept -> QVariantMap;
     auto Update(const QVariantMap &parameters) noexcept -> QVariantMap;
     auto Search(const QVariantMap &parameters) noexcept -> QVariantMap;
-    void CancelTask(const QString &taskID) noexcept;
+    auto Prune() noexcept -> QVariantMap;
+
+    auto InitRunContext(const QString &runContextCfg, const QString &containerID) noexcept
+      -> QVariantMap;
+    utils::error::Result<void> initRunContext(const std::string &runContextCfg,
+                                              const std::string &containerID) noexcept;
+    void initDaemonMode(bool peerMode = false) noexcept;
+
+    virtual utils::error::Result<void>
+    applyApp(const package::Reference &reference,
+             const std::optional<std::string> &module = std::nullopt) noexcept;
+    virtual utils::error::Result<void>
+    unapplyApp(const package::Reference &reference,
+               const std::optional<std::string> &module = std::nullopt) noexcept;
+    virtual utils::error::Result<void> switchAppVersion(const package::Reference &oldRef,
+                                                        const package::Reference &newRef,
+                                                        bool removeOldRef = false) noexcept;
+    // Scan installed application dependencies and remove unreferenced packages.
+    virtual utils::error::Result<void> pruneUnused() noexcept;
+    virtual utils::error::Result<void> tryGenerateCache(const package::Reference &ref) noexcept;
+    utils::error::Result<void>
+    executeInstallHooks(const std::filesystem::path &packageFile) noexcept;
+    virtual utils::error::Result<void>
+    executePostInstallHooks(const package::Reference &ref) noexcept;
+    utils::error::Result<void> executePostUninstallHooks(const package::Reference &ref) noexcept;
+    utils::error::Result<std::filesystem::path> copyToStaging(int sourceFD) noexcept;
+    utils::error::Result<void> cleanStaging() noexcept;
+
+    virtual utils::error::Result<void> installAppDepends(Task &task,
+                                                         const api::types::v1::PackageInfoV2 &app);
+    virtual utils::error::Result<std::optional<package::ReferenceWithRepo>>
+    needToInstall(const std::string &refStr, std::optional<std::string> channel);
+    virtual utils::error::Result<
+      std::optional<std::pair<package::ReferenceWithRepo, std::vector<std::string>>>>
+    needToUpgrade(const package::FuzzyReference &fuzzyRef,
+                  std::optional<package::Reference> &local,
+                  bool installIfMissing = false);
+    virtual utils::error::Result<void>
+    installDependsRef(Task &task,
+                      const std::string &refStr,
+                      std::optional<std::string> channel = std::nullopt,
+                      std::optional<std::string> version = std::nullopt);
+    virtual utils::error::Result<void> installRef(Task &task,
+                                                  const package::ReferenceWithRepo &ref,
+                                                  std::vector<std::string> modules) noexcept;
+    virtual utils::error::Result<void> installRefModule(Task &task,
+                                                        const package::ReferenceWithRepo &ref,
+                                                        const std::string &module) noexcept;
+    utils::error::Result<void> Uninstall(PackageTask &taskContext,
+                                         const package::Reference &ref,
+                                         const std::string &module,
+                                         bool noAutoPrune = false) noexcept;
+    virtual utils::error::Result<bool> tryUninstallRef(const package::Reference &ref) noexcept;
+    utils::error::Result<void>
+    uninstallRef(const package::Reference &ref,
+                 std::optional<std::vector<std::string>> modules = std::nullopt) noexcept;
+    utils::error::Result<void> uninstallRefModule(const package::Reference &ref,
+                                                  const std::string &module) noexcept;
 
 Q_SIGNALS:
-    void TaskChanged(QString taskID, QString percentage, QString message, int status);
+    void PruneFinished(QString jobID, QVariantMap result);
+    void InitRunContextFinished(QString jobID, bool success);
 
 private:
-    QVariantMap installFromLayer(const QDBusUnixFileDescriptor &fd) noexcept;
-    QVariantMap installFromUAB(const QDBusUnixFileDescriptor &fd) noexcept;
-    utils::error::Result<api::types::v1::MinifiedInfo>
-    updateMinifiedInfo(const QFileInfo &file, const QString &appRef, const QString &uuid) noexcept;
-    linglong::repo::OSTreeRepo &repo; // NOLINT
-    std::vector<InstallTask> taskList;
+    QVariantMap installFromLayer(const QDBusUnixFileDescriptor &fd,
+                                 const api::types::v1::CommonOptions &options,
+                                 const CallerContext &ctx) noexcept;
+
+    QVariantMap installFromUAB(const QDBusUnixFileDescriptor &fd,
+                               const api::types::v1::CommonOptions &options,
+                               const CallerContext &ctx) noexcept;
+
+    QVariantMap installFromFileImpl(const QDBusUnixFileDescriptor &fd,
+                                    const QString &fileType,
+                                    const QVariantMap &options,
+                                    const CallerContext &ctx) noexcept;
+
+    QVariantMap installImpl(const QVariantMap &parameters, const CallerContext &ctx) noexcept;
+
+    QVariantMap uninstallImpl(const QVariantMap &parameters, const CallerContext &ctx) noexcept;
+
+    QVariantMap updateImpl(const QVariantMap &parameters, const CallerContext &ctx) noexcept;
+
+    QVariantMap pruneImpl() noexcept;
+
+    utils::error::Result<void> setConfigurationImpl(const QVariantMap &parameters) noexcept;
+
+    [[nodiscard]] utils::error::Result<void> lockRepo() noexcept;
+    [[nodiscard]] utils::error::Result<void> unlockRepo() noexcept;
+    [[nodiscard]] static utils::error::Result<
+      std::vector<api::types::v1::ContainerProcessStateInfo>>
+    getAllRunningContainers() noexcept;
+    utils::error::Result<bool> isRefBusy(const package::Reference &ref) noexcept;
+    void deferredUninstall() noexcept;
+    utils::error::Result<void>
+    Prune(std::vector<api::types::v1::PackageInfoV2> &removedInfo) noexcept;
+    utils::error::Result<void> removeCache(const package::Reference &ref) noexcept;
+
+    QVariantMap runActionOnTaskQueue(std::shared_ptr<Action> action, const CallerContext &ctx);
+
+    std::unique_ptr<linglong::repo::OSTreeRepo> repo;
+    std::unique_ptr<linglong::runtime::ContainerBuilder> containerBuilder;
+    PackageTaskQueue tasks;
+    PackageTaskQueue m_search_queue;
+    PackageTaskQueue m_init_run_context_queue;
+
+    int lockFd{ -1 };
+    bool daemonModeInitialized{ false };
+    bool m_peerMode{ false };
 };
 
 } // namespace linglong::service
-
-#endif

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2023 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
@@ -7,9 +7,8 @@
 #include "linglong/cli/json_printer.h"
 
 #include "linglong/api/types/v1/Generators.hpp"
-#include "linglong/package_manager/task.h"
-
-#include <qmetaobject.h>
+#include "linglong/cli/cli.h"
+#include "linglong/package/version.h"
 
 #include <QJsonArray>
 
@@ -19,10 +18,8 @@ namespace linglong::cli {
 
 void JSONPrinter::printErr(const utils::error::Error &err)
 {
-    std::cout << nlohmann::json{
-        { "code", err.code() },
-        { "message", err.message().toStdString() }
-    }.dump() << std::endl;
+    std::cout << nlohmann::json{ { "code", err.code() }, { "message", err.message() } }.dump()
+              << std::endl;
 }
 
 void JSONPrinter::printPackage(const api::types::v1::PackageInfoV2 &info)
@@ -30,9 +27,48 @@ void JSONPrinter::printPackage(const api::types::v1::PackageInfoV2 &info)
     std::cout << nlohmann::json(info).dump() << std::endl;
 }
 
+void JSONPrinter::printPackages(const std::vector<api::types::v1::PackageInfoDisplay> &list)
+{
+    std::cout << nlohmann::json(list).dump() << std::endl;
+}
+
 void JSONPrinter::printPackages(const std::vector<api::types::v1::PackageInfoV2> &list)
 {
     std::cout << nlohmann::json(list).dump() << std::endl;
+}
+
+void JSONPrinter::printSearchResult(
+  std::map<std::string, std::vector<api::types::v1::PackageInfoV2>> list)
+{
+    // 搜索结果排序, 优先级为 repo > id > channel > module > version, 高版本在前
+    for (auto &[repo, packages] : list) {
+        std::sort(packages.begin(), packages.end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.id != rhs.id)
+                return lhs.id < rhs.id;
+            if (lhs.channel != rhs.channel)
+                return lhs.channel < rhs.channel;
+            if (lhs.packageInfoV2Module != rhs.packageInfoV2Module)
+                return lhs.packageInfoV2Module < rhs.packageInfoV2Module;
+
+            auto lhsVer = package::Version::parse(lhs.version.c_str());
+            if (!lhsVer) {
+                return false;
+            }
+            auto rhsVer = package::Version::parse(rhs.version.c_str());
+            if (!rhsVer) {
+                return false;
+            }
+
+            return *lhsVer > *rhsVer;
+        });
+    }
+
+    std::cout << nlohmann::json(list).dump() << std::endl;
+}
+
+void JSONPrinter::printPruneResult(const std::vector<api::types::v1::PackageInfoV2> &list)
+{
+    printPackages(list);
 }
 
 void JSONPrinter::printContainers(const std::vector<api::types::v1::CliContainer> &list)
@@ -40,12 +76,7 @@ void JSONPrinter::printContainers(const std::vector<api::types::v1::CliContainer
     std::cout << nlohmann::json(list).dump() << std::endl;
 }
 
-void JSONPrinter::printReply(const api::types::v1::CommonResult &reply)
-{
-    std::cout << nlohmann::json(reply).dump() << std::endl;
-}
-
-void JSONPrinter::printRepoConfig(const api::types::v1::RepoConfig &config)
+void JSONPrinter::printRepoConfig(const api::types::v1::RepoConfigV2 &config)
 {
     std::cout << nlohmann::json(config).dump() << std::endl;
 }
@@ -62,17 +93,89 @@ void JSONPrinter::printContent(const QStringList &filePaths)
     std::cout << QString::fromUtf8(QJsonDocument(obj).toJson()).toStdString() << std::endl;
 }
 
-void JSONPrinter::printTaskStatus(const QString &percentage, const QString &message, int status)
+void JSONPrinter::printProgress(const double percentage, const std::string &message)
 {
-    QJsonArray jsonArray;
+    nlohmann::json json;
+    json["percentage"] = percentage;
+    json["message"] = message;
 
-    jsonArray.push_back(QJsonObject{
-      { "percentage", percentage },
-      { "message", message },
-      { "state", QMetaEnum::fromType<service::InstallTask::Status>().valueToKey(status) },
-    });
+    std::cout << json.dump() << std::endl;
+}
 
-    std::cout << QString::fromUtf8(QJsonDocument(jsonArray).toJson()).toStdString() << std::endl;
+void JSONPrinter::printUpgradeList(std::vector<api::types::v1::UpgradeListResult> &list)
+{
+    std::cout << nlohmann::json(list).dump(4) << std::endl;
+}
+
+void JSONPrinter::printInspect(const api::types::v1::InspectResult &result)
+{
+    std::cout << nlohmann::json(result).dump(4) << std::endl;
+}
+
+void JSONPrinter::printModuleSizes(const std::vector<ModuleSizeInfo> &list,
+                                   std::uint64_t actualTotalSize,
+                                   std::uint64_t repoSize)
+{
+    std::uint64_t totalExclusiveSize{ 0 };
+    std::uint64_t totalSharedSize{ 0 };
+    std::uint64_t totalLogicalSize{ 0 };
+    nlohmann::json modules = nlohmann::json::array();
+
+    for (const auto &info : list) {
+        totalExclusiveSize += info.exclusiveSize;
+        totalSharedSize += info.sharedSize;
+        totalLogicalSize += info.logicalSize;
+        modules.push_back({
+          { "id", info.id },
+          { "name", info.name },
+          { "version", info.version },
+          { "channel", info.channel },
+          { "module", info.module },
+          { "exclusiveSize", info.exclusiveSize },
+          { "sharedSize", info.sharedSize },
+          { "logicalSize", info.logicalSize },
+          { "actualSize", info.actualSize },
+        });
+    }
+
+    std::cout << nlohmann::json{
+      { "modules", modules },
+      { "calculatedLogicalSize",
+        { { "exclusiveSize", totalExclusiveSize },
+          { "sharedSize", totalSharedSize },
+          { "logicalSize", totalLogicalSize } } },
+      { "calculatedActualSize", actualTotalSize },
+      { "repositoryRealSize", repoSize },
+    }.dump(4)
+              << std::endl;
+}
+
+void JSONPrinter::printDepends(const std::vector<DependsNode> &trees)
+{
+    auto toJson = [](const DependsNode &node, const auto &self) -> nlohmann::json {
+        auto children = nlohmann::json::array();
+        for (const auto &child : node.children) {
+            children.push_back(self(child, self));
+        }
+
+        return {
+            { "ref", node.ref },
+            { "kind", node.kind },
+            { "children", children },
+        };
+    };
+
+    auto result = nlohmann::json::array();
+    for (const auto &tree : trees) {
+        result.push_back(toJson(tree, toJson));
+    }
+
+    std::cout << result.dump(4) << std::endl;
+}
+
+void JSONPrinter::printMessage(const std::string &message)
+{
+    std::cout << nlohmann::json{ { "message", message } }.dump() << std::endl;
 }
 
 } // namespace linglong::cli

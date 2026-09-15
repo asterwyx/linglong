@@ -5,8 +5,5 @@
 namespace ocppi::runtime
 {
 
-class Signal : public std::string {
-        using std::string::string;
-};
-
+using Signal = std::string;
 }

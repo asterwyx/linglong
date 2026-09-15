@@ -1,216 +1,367 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #include "linglong/runtime/container.h"
 
-#include "linglong/package/architecture.h"
+#include "configure.h"
+#include "linglong/common/dir.h"
+#include "linglong/common/error.h"
+#include "linglong/common/helper.h"
+#include "linglong/common/socket.h"
+#include "linglong/runtime/container_builder.h"
+#include "linglong/runtime/overlayfs_driver.h"
+#include "linglong/runtime/run_context.h"
+#include "linglong/utils/bash_command_helper.h"
+#include "linglong/utils/file.h"
+#include "linglong/utils/filelock.h"
 #include "linglong/utils/finally/finally.h"
+#include "linglong/utils/log/log.h"
+#include "linglong/utils/overlayfs.h"
+#include "ocppi/runtime/ExecOption.hpp"
 #include "ocppi/runtime/RunOption.hpp"
 #include "ocppi/runtime/config/types/Generators.hpp"
 
-#include <QDir>
-#include <QStandardPaths>
+#include <fmt/format.h>
+#include <sys/epoll.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
+#include <sys/sysmacros.h>
+#include <sys/termios.h>
 
-#include <filesystem>
+#include <cassert>
 #include <fstream>
+#include <memory>
+#include <utility>
+#include <variant>
 
-#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+void mergeProcessConfig(ocppi::runtime::config::types::Process &dst,
+                        const ocppi::runtime::config::types::Process &src)
+{
+    if (src.user) {
+        dst.user = src.user;
+    }
+
+    if (src.apparmorProfile) {
+        dst.apparmorProfile = src.apparmorProfile;
+    }
+
+    if (src.args) {
+        dst.args = src.args;
+    }
+
+    if (src.capabilities) {
+        dst.capabilities = src.capabilities;
+    }
+
+    if (src.commandLine) {
+        dst.commandLine = src.commandLine;
+    }
+
+    if (src.consoleSize) {
+        dst.consoleSize = src.consoleSize;
+    }
+
+    if (!src.cwd.empty()) {
+        dst.cwd = src.cwd;
+    }
+
+    if (src.env) {
+        if (!dst.env) {
+            dst.env = src.env;
+        } else {
+            auto &dstEnv = dst.env.value();
+            for (const auto &env : src.env.value()) {
+                auto key = env.find_first_of('=');
+                if (key == std::string::npos) {
+                    continue;
+                }
+
+                auto it =
+                  std::find_if(dstEnv.begin(), dstEnv.end(), [&key, &env](const std::string &dst) {
+                      return dst.rfind(std::string_view(env.data(), key + 1), 0) == 0;
+                  });
+
+                if (it != dstEnv.end()) {
+                    LogW("environment set multiple times {} {}", *it, env);
+                    *it = env;
+                } else {
+                    dstEnv.emplace_back(env);
+                }
+            }
+        }
+    }
+
+    if (src.ioPriority) {
+        dst.ioPriority = src.ioPriority;
+    }
+
+    if (src.noNewPrivileges) {
+        dst.noNewPrivileges = src.noNewPrivileges;
+    }
+
+    if (src.oomScoreAdj) {
+        dst.oomScoreAdj = src.oomScoreAdj;
+    }
+
+    if (src.rlimits) {
+        dst.rlimits = src.rlimits;
+    }
+
+    if (src.scheduler) {
+        dst.scheduler = src.scheduler;
+    }
+
+    if (src.selinuxLabel) {
+        dst.selinuxLabel = src.selinuxLabel;
+    }
+
+    if (src.terminal) {
+        dst.terminal = src.terminal;
+    }
+
+    if (src.user) {
+        dst.user = src.user;
+    }
+}
+} // namespace
 
 namespace linglong::runtime {
 
-Container::Container(const ocppi::runtime::config::types::Config &cfg,
-                     const QString &appID,
-                     const QString &conatinerID,
-                     ocppi::cli::CLI &cli)
-    : cfg(cfg)
-    , id(conatinerID)
-    , appID(appID)
-    , cli(cli)
+auto ContainerContext::create(RunContext &context, CreateOptions options)
+  -> utils::error::Result<std::unique_ptr<ContainerContext>>
 {
-    Q_ASSERT(cfg.process.has_value());
+    LINGLONG_TRACE("create container context");
+
+    auto containerID = context.getContainerId();
+    auto bundleDir = makeBundleDir(containerID, options.bundleSuffix);
+    if (!bundleDir) {
+        return LINGLONG_ERR("create bundle dir", bundleDir);
+    }
+
+    auto res = utils::ensureDirectory(*bundleDir / "rootfs");
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    if (options.appCache) {
+        res = utils::ensureDirectory(*options.appCache);
+        if (!res) {
+            return LINGLONG_ERR("ensure app cache directory", res);
+        }
+    }
+
+    auto ret = std::make_unique<ContainerContext>(constract_passkey{},
+                                                  std::move(containerID),
+                                                  std::move(bundleDir).value(),
+                                                  std::move(options.appCache));
+    return ret;
 }
 
-utils::error::Result<void>
-Container::run(const ocppi::runtime::config::types::Process &process) noexcept
+ContainerContext::ContainerContext([[maybe_unused]] constract_passkey key,
+                                   std::string containerID,
+                                   std::filesystem::path bundleDir,
+                                   std::optional<std::filesystem::path> appCache)
+    : containerID(std::move(containerID))
+    , bundleDir(std::move(bundleDir))
+    , appCache(std::move(appCache))
 {
-    LINGLONG_TRACE(QString("run container %1").arg(this->id));
+}
 
-    QDir runtimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+auto ContainerContext::setupOverlayFS(RunContext &context, bool persistent)
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("setup container context overlayfs");
 
-    // bundle dir is already created in ContainerBuilder::create
-    QDir bundle = runtimeDir.absoluteFilePath(QString("linglong/%1").arg(this->id));
-
-    if (!bundle.mkpath("./rootfs")) {
-        return LINGLONG_ERR("make rootfs directory");
+    auto parsedMode = OverlayFSDriver::modeFromString(*context.getConfig().overlayfs);
+    if (!parsedMode) {
+        return LINGLONG_ERR("invalid overlayfs mode", parsedMode);
     }
-    auto _ = utils::finally::finally([&]() {
-        if (!qgetenv("LINGLONG_DEBUG").isEmpty()) {
-            runtimeDir.mkpath("linglong/debug");
-            auto archive = runtimeDir.absoluteFilePath(QString("linglong/debug/%1").arg(this->id));
-            if (QDir().rename(bundle.absolutePath(), archive)) {
-                return;
-            }
-            qCritical() << "failed to archive" << bundle.absolutePath() << "to" << archive;
+
+    auto driver = OverlayFSDriver::create(*parsedMode);
+    if (!this->appCache) {
+        return LINGLONG_ERR("app cache is empty");
+    }
+
+    const auto &baseLayer = context.getBaseLayer();
+    if (!baseLayer) {
+        return LINGLONG_ERR("base layer not found");
+    }
+
+    auto overlayInternal = *this->appCache / "overlay";
+    auto overlayFS = driver->createOverlayFS({ baseLayer->getLayerDir()->filesDirPath() },
+                                             overlayInternal,
+                                             this->bundleDir,
+                                             persistent);
+    if (!overlayFS) {
+        return LINGLONG_ERR("create overlayfs", overlayFS);
+    }
+
+    if (!(*overlayFS)->mount()) {
+        return LINGLONG_ERR("mount overlayfs");
+    }
+
+    this->overlayFS = std::move(*overlayFS);
+
+    return LINGLONG_OK;
+}
+
+auto ContainerContext::getContainerID() const -> const std::string &
+{
+    return this->containerID;
+}
+
+auto ContainerContext::getBundleDir() const -> const std::filesystem::path &
+{
+    return this->bundleDir;
+}
+
+auto ContainerContext::getContainerCache() const -> const std::optional<std::filesystem::path> &
+{
+    return this->appCache;
+}
+
+void ContainerContext::addSecurityContext(std::unique_ptr<SecurityContext> securityContext)
+{
+    this->securityContexts.emplace_back(std::move(securityContext));
+}
+
+auto ContainerContext::genLdConf(const std::string &ldConf, bool overlayEnabled)
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("generate ld.so.conf");
+
+    std::filesystem::path ldConfPath;
+    if (overlayEnabled) {
+        ldConfPath =
+          this->bundleDir / "rootfs" / "etc" / "ld.so.conf.d" / "zz_deepin-linglong-app.conf";
+
+        auto ensureRes = utils::ensureDirectory(ldConfPath.parent_path());
+        if (!ensureRes) {
+            return LINGLONG_ERR("create ld config directory in overlay rootfs", ensureRes);
         }
-        if (bundle.removeRecursively()) {
-            return;
+    } else {
+        if (!this->appCache) {
+            return LINGLONG_ERR("container cache is empty");
         }
-        qCritical() << "failed to remove" << runtimeDir.absolutePath();
-    });
 
-    if (!this->cfg.process) {
-        // NOTE: process should be set in /usr/lib/linglong/container/config.json,
-        // and configuration generator must not delete it.
-        // So it's a bug if process no has_value at this time.
-        Q_ASSERT(false);
-        return LINGLONG_ERR("process is not set");
+        ldConfPath = *this->appCache / "ld.so.conf";
     }
 
-    if (!this->cfg.process->env.has_value()) {
-        // NOTE: same as above.
-        Q_ASSERT(false);
-        return LINGLONG_ERR("process.env is not set");
+    auto res = utils::writeFile(ldConfPath, ldConf);
+    if (!res) {
+        return LINGLONG_ERR(fmt::format("failed to write {}", ldConfPath), res);
     }
 
-    auto originEnvs = this->cfg.process->env.value();
-    this->cfg.process = process;
+    return LINGLONG_OK;
+}
 
-    if (this->cfg.process->user) {
-        qWarning() << "`user` field is ignored.";
+ContainerContext::~ContainerContext()
+{
+    if (this->overlayFS) {
+        this->overlayFS->unmount();
     }
 
-    if (!this->cfg.process->env) {
-        qDebug() << "user `env` field is not exists.";
-        this->cfg.process->env = std::vector<std::string>{};
+    if (getenv("LINGLONG_DEBUG") == nullptr && !this->bundleDir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(this->bundleDir, ec);
+        if (ec) {
+            LogW("failed to remove bundle directory {}: {}", this->bundleDir, ec.message());
+        }
     }
+}
 
+Container::Container(ocppi::runtime::config::types::Config cfg,
+                     std::unique_ptr<ContainerContext> context,
+                     ocppi::cli::CLI &cli)
+    : cfg(std::move(cfg))
+    , context(std::move(context))
+    , cli(cli)
+{
+    assert(this->context != nullptr);
+    assert(this->cfg.process.has_value());
+}
+
+utils::error::Result<void> Container::run(const ocppi::runtime::config::types::Process &process,
+                                          ocppi::runtime::RunOption opt) noexcept
+{
+    LINGLONG_TRACE(fmt::format("run container {}", this->context->getContainerID()));
+
+    auto curProcess =
+      std::move(this->cfg.process).value_or(ocppi::runtime::config::types::Process{});
+    mergeProcessConfig(curProcess, process);
+    this->cfg.process = std::move(curProcess);
+
+    std::error_code ec;
     if (this->cfg.process->cwd.empty()) {
-        qDebug() << "cwd of process is empty, run process in current directory.";
-        this->cfg.process->cwd = ("/run/host/rootfs" + QDir::currentPath()).toStdString();
+        auto cwd = std::filesystem::current_path(ec);
+        LogD("cwd of process is empty, run process in current directory {}.", cwd);
+        this->cfg.process->cwd = std::filesystem::path{ "/run/host/rootfs" } / cwd;
     }
 
-    this->cfg.process->user = ocppi::runtime::config::types::User{
-        .gid = getgid(),
-        .uid = getuid(),
-    };
+    if (!this->cfg.process->user) {
+        this->cfg.process->user =
+          ocppi::runtime::config::types::User{ .gid = ::getgid(), .uid = ::getuid() };
+    }
 
-    if (isatty(fileno(stdin)) != 0) {
+    if (isatty(STDOUT_FILENO) == 1 || isatty(STDERR_FILENO) == 1) {
         this->cfg.process->terminal = true;
     }
-    // 在原始args前面添加bash --login -c，这样可以使用/etc/profile配置的环境变量
-    if (process.args.has_value()) {
-        QStringList bashArgs;
-        // 为避免原始args包含空格，每个arg都使用单引号包裹，并对arg内部的单引号进行转义替换
-        for (const auto &arg : *process.args) {
-            bashArgs.push_back(
-              QString("'%1'").arg(QString::fromStdString(arg).replace("'", "'\\''")));
-        }
-        // quickfix: 某些应用在以bash -c启动后，收到SIGTERM后不会完全退出
-        bashArgs.push_back("; wait");
-        auto arguments = std::vector<std::string>{
-            "/bin/bash", "--login", "-e", "-c", bashArgs.join(" ").toStdString(),
-        };
-        this->cfg.process->args = arguments;
-    }
 
-    for (const auto &env : *this->cfg.process->env) {
-        auto key = env.substr(0, env.find_first_of('='));
-        auto it =
-          std::find_if(originEnvs.cbegin(), originEnvs.cend(), [&key](const std::string &env) {
-              return env.rfind(key, 0) == 0;
-          });
-
-        if (it != originEnvs.cend()) {
-            qWarning() << "duplicate environment has been detected: ["
-                       << "original:" << QString::fromStdString(*it)
-                       << "user:" << QString::fromStdString(env) << "], choose original.";
-            continue;
-        }
-
-        originEnvs.emplace_back(env);
-    }
-
-    this->cfg.process->env = originEnvs;
-
-    auto arch = package::Architecture::parse(QSysInfo::currentCpuArchitecture());
-    if (!arch) {
-        return LINGLONG_ERR(arch);
-    }
-    {
-        std::ofstream ofs(
-          bundle.absoluteFilePath("zz_deepin-linglong-app.ld.so.conf").toStdString());
-        Q_ASSERT(ofs.is_open());
-        if (!ofs.is_open()) {
-            return LINGLONG_ERR("create ld config in bundle directory");
-        }
-
-        ofs << "/runtime/lib" << std::endl;
-        ofs << "/runtime/lib/" + arch->getTriplet().toStdString() << std::endl;
-        ofs << "/opt/apps/" + this->appID.toStdString() + "/files/lib" << std::endl;
-        ofs << "/opt/apps/" + this->appID.toStdString() + "/files/lib/"
-            + arch->getTriplet().toStdString()
-            << std::endl;
-    }
     this->cfg.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.conf.d/zz_deepin-linglong-app.conf",
+      .destination = "/run/linglong/container-init",
       .options = { { "ro", "rbind" } },
-      .source = bundle.absoluteFilePath("zz_deepin-linglong-app.ld.so.conf").toStdString(),
+      .source = std::string{ LINGLONG_CONTAINER_INIT },
       .type = "bind",
     });
 
-    {
-        std::ofstream ofs(bundle.absoluteFilePath("ld.so.cache").toStdString());
-        Q_ASSERT(ofs.is_open());
-        if (!ofs.is_open()) {
-            return LINGLONG_ERR("create ld config in bundle directory");
-        }
+    auto originalArgs =
+      this->cfg.process->args.value_or(std::vector<std::string>{ "echo", "noting to run" });
+
+    auto bundleDir = this->context->getBundleDir();
+    auto entrypoint = bundleDir / "entrypoint.sh";
+    auto res = utils::writeFile(entrypoint,
+                                utils::BashCommandHelper::generateEntrypointScript(originalArgs));
+    if (!res) {
+        return LINGLONG_ERR(fmt::format("failed to write to {}", entrypoint), res);
     }
-    {
-        std::ofstream ofs(bundle.absoluteFilePath("ld.so.cache~").toStdString());
-        Q_ASSERT(ofs.is_open());
-        if (!ofs.is_open()) {
-            return LINGLONG_ERR("create ld config in bundle directory");
-        }
+
+    std::filesystem::permissions(entrypoint, std::filesystem::perms::owner_all, ec);
+    if (ec) {
+        return LINGLONG_ERR("make entrypoint executable", ec);
     }
+
+    const auto *entrypointPath = "/run/linglong/entrypoint.sh";
+
     this->cfg.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.cache",
-      .options = { { "rbind" } },
-      .source = bundle.absoluteFilePath("ld.so.cache").toStdString(),
-      .type = "bind",
-    });
-    this->cfg.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.cache~",
-      .options = { { "rbind" } },
-      .source = bundle.absoluteFilePath("ld.so.cache~").toStdString(),
+      .destination = entrypointPath,
+      .options = { { "ro", "rbind" } },
+      .source = entrypoint,
       .type = "bind",
     });
 
-    nlohmann::json json = this->cfg;
-
-    {
-        std::ofstream ofs(bundle.absoluteFilePath("config.json").toStdString());
-        Q_ASSERT(ofs.is_open());
-        if (!ofs.is_open()) {
-            return LINGLONG_ERR("create config.json in bundle directory");
-        }
-
-        ofs << json.dump();
-        ofs.close();
+    auto cmd = utils::BashCommandHelper::generateInitCommand(entrypointPath);
+    this->cfg.process->args = cmd;
+    res = utils::writeFile(bundleDir / "config.json", nlohmann::json(this->cfg).dump());
+    if (!res) {
+        return LINGLONG_ERR("failed to write to config.json", res);
     }
-    qDebug() << "run container in " << bundle.path();
-    ocppi::runtime::RunOption opt;
+
+    LogD("run container with bundle {}", bundleDir);
     // 禁用crun自己创建cgroup，便于AM识别和管理玲珑应用
-    opt.GlobalOption::extra.push_back({ "--cgroup-manager=disabled" });
-    auto result = this->cli.run(ocppi::runtime::ContainerID(this->id.toStdString()),
-                                std::filesystem::path(bundle.absolutePath().toStdString()),
-                                opt);
+    opt.GlobalOption::extra.emplace_back("--cgroup-manager=disabled");
 
+    auto result = this->cli.run(this->context->getContainerID(), bundleDir, opt);
     if (!result) {
-        return LINGLONG_ERR("cli run", result);
+        return LINGLONG_ERR("cli run", result.error());
     }
 
     return LINGLONG_OK;

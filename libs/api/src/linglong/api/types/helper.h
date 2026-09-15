@@ -3,13 +3,34 @@
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
-
-#ifndef LINGLONG_API_TYPES_HELPER_H_
-#define LINGLONG_API_TYPES_HELPER_H_
+#pragma once
 
 #include "linglong/api/types/v1/RepoConfig.hpp"
+#include "linglong/api/types/v1/RepoConfigV2.hpp"
+#include "linglong/api/types/v1/UpgradeListResult.hpp"
 
 namespace linglong::api::types::v1 {
+
+// I added this size assertion because these structs overload == operator.
+// Adding new fields will make this fail, reminding me to update the == implementation.
+#ifndef __i386__
+static_assert(sizeof(struct Repo) == 160);
+static_assert(sizeof(struct RepoConfig) == 88);
+static_assert(sizeof(struct RepoConfigV2) == 64);
+static_assert(sizeof(struct UpgradeListResult) == 96);
+#endif
+
+inline bool operator==(const Repo &cfg1, const Repo &cfg2) noexcept
+{
+    return cfg1.alias == cfg2.alias && cfg1.name == cfg2.name && cfg1.url == cfg2.url
+      && cfg1.priority == cfg2.priority && cfg1.mirrorEnabled == cfg2.mirrorEnabled
+      && cfg1.region == cfg2.region;
+}
+
+inline bool operator!=(const Repo &cfg1, const Repo &cfg2) noexcept
+{
+    return !(cfg1 == cfg2);
+}
 
 inline bool operator==(const RepoConfig &cfg1, const RepoConfig &cfg2) noexcept
 {
@@ -22,5 +43,20 @@ inline bool operator!=(const RepoConfig &cfg1, const RepoConfig &cfg2) noexcept
     return !(cfg1 == cfg2);
 }
 
+inline bool operator==(const RepoConfigV2 &cfg1, const RepoConfigV2 &cfg2) noexcept
+{
+    return cfg1.version == cfg2.version && cfg1.repos == cfg2.repos
+      && cfg1.defaultRepo == cfg2.defaultRepo;
+}
+
+inline bool operator!=(const RepoConfigV2 &cfg1, const RepoConfigV2 &cfg2) noexcept
+{
+    return !(cfg1 == cfg2);
+}
+
+inline bool operator==(const UpgradeListResult &lhs, const UpgradeListResult &rhs)
+{
+    return lhs.id == rhs.id && lhs.newVersion == rhs.newVersion && lhs.oldVersion == rhs.oldVersion;
+}
+
 } // namespace linglong::api::types::v1
-#endif

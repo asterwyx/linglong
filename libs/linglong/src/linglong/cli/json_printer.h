@@ -1,30 +1,41 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_CLI_JSON_PRINTER_H_
-#define LINGLONG_CLI_JSON_PRINTER_H_
+#pragma once
 
+#include "linglong/api/types/v1/PackageInfoV2.hpp"
+#include "linglong/cli/cli.h"
 #include "linglong/cli/printer.h"
 
 namespace linglong::cli {
 
 class JSONPrinter : public Printer
 {
+private:
+    void printPackages(const std::vector<api::types::v1::PackageInfoV2> &);
+
 public:
     void printErr(const utils::error::Error &) override;
     void printPackage(const api::types::v1::PackageInfoV2 &) override;
-    void printPackages(const std::vector<api::types::v1::PackageInfoV2> &) override;
+    void printPackages(const std::vector<api::types::v1::PackageInfoDisplay> &) override;
+    void
+      printSearchResult(std::map<std::string, std::vector<api::types::v1::PackageInfoV2>>) override;
+    void printPruneResult(const std::vector<api::types::v1::PackageInfoV2> &) override;
     void printContainers(const std::vector<api::types::v1::CliContainer> &) override;
-    void printReply(const api::types::v1::CommonResult &) override;
-    void printRepoConfig(const api::types::v1::RepoConfig &) override;
+    void printRepoConfig(const api::types::v1::RepoConfigV2 &) override;
     void printLayerInfo(const api::types::v1::LayerInfo &) override;
-    void printTaskStatus(const QString &percentage, const QString &message, int status) override;
+    void printProgress(double percentage, const std::string &message) override;
     void printContent(const QStringList &desktopPaths) override;
+    void printUpgradeList(std::vector<api::types::v1::UpgradeListResult> &) override;
+    void printInspect(const api::types::v1::InspectResult &) override;
+    void printModuleSizes(const std::vector<ModuleSizeInfo> &list,
+                          std::uint64_t actualTotalSize,
+                          std::uint64_t repoSize) override;
+    void printDepends(const std::vector<DependsNode> &trees) override;
+    void printMessage(const std::string &message) override;
 };
 
 } // namespace linglong::cli
-
-#endif

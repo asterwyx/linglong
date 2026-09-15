@@ -1,23 +1,23 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #include "linglong/package/layer_dir.h"
 
-#include "linglong/api/types/v1/Generators.hpp"
-#include "linglong/utils/packageinfo_handler.h"
+#include "linglong/utils/log/log.h"
+#include "linglong/utils/serialize/packageinfo_handler.h"
 
-#include <fstream>
+#include <fmt/format.h>
 
 namespace linglong::package {
 
 utils::error::Result<api::types::v1::PackageInfoV2> LayerDir::info() const
 {
-    LINGLONG_TRACE("get layer info from " + this->absolutePath());
+    LINGLONG_TRACE(fmt::format("get layer info from {}", this->path_.string()));
 
-    auto info = utils::parsePackageInfo(this->filePath("info.json"));
+    auto info = utils::serialize::parsePackageInfoFile(this->path_ / "info.json");
     if (!info) {
         return LINGLONG_ERR(info);
     }
@@ -25,29 +25,54 @@ utils::error::Result<api::types::v1::PackageInfoV2> LayerDir::info() const
     return info;
 }
 
-utils::error::Result<api::types::v1::MinifiedInfo> LayerDir::minifiedInfo() const
+std::filesystem::path LayerDir::filesDirPath() const noexcept
 {
-    LINGLONG_TRACE("get minified info from " + absolutePath())
-    auto filePath = absoluteFilePath("minified.json");
-
-    std::fstream stream{ filePath.toStdString() };
-    if (!stream.is_open()) {
-        return LINGLONG_ERR(QString{ "couldn't open file %1" }.arg(filePath));
-    }
-
-    nlohmann::json content;
-    try {
-        content = nlohmann::json::parse(stream);
-    } catch (nlohmann::json::parse_error &e) {
-        return LINGLONG_ERR(QString{ "parsing minified.json error: %1" }.arg(e.what()));
-    }
-
-    return content.get<api::types::v1::MinifiedInfo>();
+    return this->path_ / "files";
 }
 
-bool LayerDir::hasMinified() const noexcept
+bool LayerDir::valid() const noexcept
 {
-    return this->exists("minified.json");
+    std::error_code ec;
+    return std::filesystem::exists(this->path_ / "info.json", ec);
+}
+
+TempLayerDir::TempLayerDir(TempLayerDir &&other) noexcept
+    : layerDir_(std::move(other.layerDir_))
+    , ownsPath_(other.ownsPath_)
+{
+    other.ownsPath_ = false;
+}
+
+TempLayerDir &TempLayerDir::operator=(TempLayerDir &&other) noexcept
+{
+    if (this == &other) {
+        return *this;
+    }
+
+    remove();
+    layerDir_ = std::move(other.layerDir_);
+    ownsPath_ = other.ownsPath_;
+    other.ownsPath_ = false;
+    return *this;
+}
+
+TempLayerDir::~TempLayerDir() noexcept
+{
+    remove();
+}
+
+void TempLayerDir::remove() noexcept
+{
+    if (!ownsPath_ || layerDir_.path().empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(layerDir_.path(), ec);
+    if (ec) {
+        LogW("failed to remove temporary layer directory {}: {}", layerDir_.path(), ec.message());
+    }
+    ownsPath_ = false;
 }
 
 } // namespace linglong::package

@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef LINGLONG_UTILS_FINALLY_H_
-#define LINGLONG_UTILS_FINALLY_H_
+#pragma once
 
 // Code in this file comes from
 // https://github.com/microsoft/GSL/blob/52212c2d7600c816ec9b0438d3fbd2a95c190c2f/include/gsl/util
@@ -34,7 +33,7 @@ namespace linglong::utils::finally {
 using index = std::ptrdiff_t;
 
 // final_action allows you to ensure something gets run at the end of a scope
-template<class F>
+template <class F>
 class final_action
 {
 public:
@@ -70,11 +69,9 @@ private:
 };
 
 // finally() - convenience function to generate a final_action
-template<class F>
+template <class F>
 [[nodiscard]] auto finally(F &&f) noexcept
 {
     return final_action<std::decay_t<F>>{ std::forward<F>(f) };
 }
 } // namespace linglong::utils::finally
-
-#endif

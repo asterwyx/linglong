@@ -1,32 +1,95 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_SRC_BUILDER_BUILDER_LINGLONG_BUILDER_H_
-#define LINGLONG_SRC_BUILDER_BUILDER_LINGLONG_BUILDER_H_
+#pragma once
 
 #include "linglong/api/types/v1/BuilderConfig.hpp"
 #include "linglong/api/types/v1/BuilderProject.hpp"
 #include "linglong/repo/ostree_repo.h"
 #include "linglong/runtime/container_builder.h"
+#include "linglong/runtime/run_context.h"
 #include "linglong/utils/error/error.h"
+#include "linglong/utils/overlayfs.h"
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace linglong::builder {
 
-struct UABOption
-{
-    QString iconPath;
-    bool exportDevelop{ false };
-    bool exportI18n{ false };
+enum class ExportMode {
+    Distribution,
+    Exec,
 };
+
+struct ExportOption
+{
+    std::string iconPath;
+    std::string loader;
+    std::string compressor;
+    std::string ref;
+    std::vector<std::string> modules;
+    bool noExportDevelop{ false };
+    ExportMode mode{ ExportMode::Distribution };
+};
+
+struct BuilderBuildOptions
+{
+    // 兼容选项，在制作runtime时构建全量develop, 以兼容旧版本linglong-builder使用
+    // TODO 后续版本删除该选项
+    bool fullDevelop{ false };
+    bool skipFetchSource{ false };
+    bool skipPullDepend{ false };
+    bool skipRunContainer{ false };
+    bool skipCommitOutput{ false };
+    bool skipCheckOutput{ false };
+    bool skipStripSymbols{ false };
+    bool isolateNetWork{ false };
+};
+
+utils::error::Result<std::vector<std::filesystem::path>>
+installModule(const std::filesystem::path &buildOutput,
+              const std::filesystem::path &moduleOutput,
+              const std::unordered_set<std::string> &rules);
+utils::error::Result<void> cmdListApp(repo::OSTreeRepo &repo);
+utils::error::Result<void> cmdRemoveApp(repo::OSTreeRepo &repo,
+                                        std::vector<std::string> refs,
+                                        bool prune);
+
+namespace detail {
+void mergeOutput(const std::vector<std::filesystem::path> &src,
+                 const std::filesystem::path &dest,
+                 const std::vector<std::string> &targets,
+                 const std::vector<std::string> &excludes);
+utils::error::Result<void> pullResolvedRef(const package::ReferenceWithRepo &refRepo,
+                                           repo::OSTreeRepo &repo,
+                                           const std::string &module) noexcept;
+using DependencyReference =
+  std::pair<std::optional<package::ReferenceWithRepo>, std::optional<package::Reference>>;
+utils::error::Result<DependencyReference>
+clearDependency(const std::string &fuzzyRefStr,
+                repo::OSTreeRepo &repo,
+                bool useRemote,
+                std::optional<std::string> module = std::nullopt) noexcept;
+utils::error::Result<package::Reference> pullDependency(const std::string &fuzzyRefStr,
+                                                        repo::OSTreeRepo &repo,
+                                                        const std::string &module) noexcept;
+} // namespace detail
 
 class Builder
 {
 public:
-    explicit Builder(const api::types::v1::BuilderProject &project,
-                     QDir workingDir,
+    // 记录linglong.yaml的位置，因为可以通过命令行参数传递，位置不再固定
+    // 主要用于在构建完成后将linglong.yaml复制到应用中
+    std::string projectYamlFile;
+    explicit Builder(std::optional<api::types::v1::BuilderProject> project,
+                     std::filesystem::path workingDir,
                      repo::OSTreeRepo &repo,
                      runtime::ContainerBuilder &containerBuilder,
                      const api::types::v1::BuilderConfig &cfg);
@@ -35,40 +98,92 @@ public:
 
     auto create(const QString &projectName) -> utils::error::Result<void>;
 
-    auto build(const QStringList &args = {
-                 "/project/linglong/entry.sh" }) noexcept -> utils::error::Result<void>;
+    auto build(const QStringList &args = { "/project/linglong/entry.sh" }) noexcept
+      -> utils::error::Result<void>;
 
-    auto exportUAB(const QString &destination,
-                   const UABOption &option) -> utils::error::Result<void>;
-    auto exportLayer(const QString &destination) -> utils::error::Result<void>;
+    auto exportUAB(const ExportOption &option, const std::filesystem::path &outputFile = {})
+      -> utils::error::Result<void>;
+    auto exportLayer(const ExportOption &option) -> utils::error::Result<void>;
 
-    auto extractLayer(const QString &layerPath,
-                      const QString &destination) -> utils::error::Result<void>;
+    static auto extractLayer(const QString &layerPath, const QString &destination)
+      -> utils::error::Result<void>;
 
-    auto push(bool pushWithDevel = true,
-              const QString &repoUrl = "",
-              const QString &repoName = "") -> utils::error::Result<void>;
+    auto push(const std::string &module,
+              const std::string &repoUrl = "",
+              const std::string &repoName = "") -> utils::error::Result<void>;
 
     auto import() -> utils::error::Result<void>;
 
-    auto importLayer(const QString &path) -> utils::error::Result<void>;
+    static auto importLayer(repo::OSTreeRepo &repo, const std::filesystem::path &path)
+      -> utils::error::Result<void>;
 
-    auto run(const QStringList &args = { QString("bash") }) -> utils::error::Result<void>;
+    auto run(std::vector<std::string> modules,
+             std::vector<std::string> args,
+             bool debug = false,
+             const std::string &workdir = "",
+             std::vector<std::string> extensions = {}) -> utils::error::Result<void>;
+    auto runtimeCheck() -> utils::error::Result<void>;
+    auto runFromRepo(const package::Reference &ref, const std::vector<std::string> &args)
+      -> utils::error::Result<void>;
 
-    auto appimageConvert(const QStringList &templateArgs) -> utils::error::Result<void>;
+    void setBuildOptions(const BuilderBuildOptions &options) noexcept { buildOptions = options; }
+
+    auto cleanBuildArtifacts() noexcept -> utils::error::Result<void>;
+
+protected:
+    std::string uabExportFilename(const linglong::package::Reference &ref, ExportMode mode);
+    std::string layerExportFilename(const linglong::package::Reference &ref,
+                                    const std::string &module);
 
 private:
-    auto splitDevelop(QDir developOutput,
-                      QDir runtimeOutput,
-                      QString prefix) -> utils::error::Result<void>;
+    auto buildStagePrepare() noexcept -> utils::error::Result<void>;
+    auto buildStageFetchSource() noexcept -> utils::error::Result<void>;
+    utils::error::Result<void> buildStagePullDependency() noexcept;
+    utils::error::Result<bool> buildStageBuild(const QStringList &args) noexcept;
+    utils::error::Result<void> buildStagePreBuild() noexcept;
+    utils::error::Result<void> buildStagePreCommit() noexcept;
+    utils::error::Result<bool> buildStageCommit() noexcept;
 
+    utils::error::Result<void> generateAppConf() noexcept;
+    utils::error::Result<void> installFiles() noexcept;
+    utils::error::Result<void> generateEntries() noexcept;
+    utils::error::Result<void> processBuildDepends() noexcept;
+    utils::error::Result<void> commitToLocalRepo() noexcept;
+    std::unique_ptr<utils::OverlayFS> makeOverlay(const std::filesystem::path &lowerdir,
+                                                  const std::filesystem::path &overlayDir) noexcept;
+    void fixLocaltimeInOverlay(std::unique_ptr<utils::OverlayFS> &base);
+    utils::error::Result<package::Reference>
+    ensureUtils(const std::string &id, const package::Architecture &arch) noexcept;
+    auto generateEntryScript() noexcept -> utils::error::Result<void>;
+    auto generateBuildDependsScript() noexcept -> utils::error::Result<bool>;
+    auto generateDependsScript() noexcept -> utils::error::Result<bool>;
+    void takeTerminalForeground();
+    void printBasicInfo();
+    void printRepo();
+    bool checkDeprecatedInstallFile();
+
+private:
     repo::OSTreeRepo &repo;
-    QDir workingDir;
-    api::types::v1::BuilderProject project;
+    std::filesystem::path workingDir;
+    std::filesystem::path internalDir;
+    std::optional<api::types::v1::BuilderProject> project;
     runtime::ContainerBuilder &containerBuilder;
     api::types::v1::BuilderConfig cfg;
+    BuilderBuildOptions buildOptions;
+
+    int64_t uid;
+    int64_t gid;
+
+    std::optional<package::Reference> projectRef;
+    std::vector<std::string> packageModules;
+    std::unique_ptr<utils::OverlayFS> baseOverlay;
+    std::unique_ptr<utils::OverlayFS> runtimeOverlay;
+    std::filesystem::path buildOutput;
+    std::string installPrefix;
+    runtime::RunContext buildContext;
+
+    // capabilities for build stage
+    static std::vector<std::string> privilegeBuilderCaps;
 };
 
 } // namespace linglong::builder
-
-#endif // LINGLONG_SRC_BUILDER_BUILDER_LINGLONG_BUILDER_H_

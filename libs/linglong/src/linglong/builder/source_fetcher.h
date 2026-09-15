@@ -4,36 +4,34 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_SRC_BUILDER_SOURCE_FETCHER_H_
-#define LINGLONG_SRC_BUILDER_SOURCE_FETCHER_H_
+#pragma once
 
 #include "linglong/api/types/v1/BuilderConfig.hpp"
 #include "linglong/api/types/v1/BuilderProjectSource.hpp"
+#include "linglong/utils/cmd.h"
 #include "linglong/utils/error/error.h"
 
+#include <QDir>
 #include <QFileInfo>
 #include <QObject>
 #include <QUrl>
-#include <QDir>
 
 namespace linglong::builder {
 
 class SourceFetcher
 {
 public:
-    explicit SourceFetcher(api::types::v1::BuilderProjectSource s,
-                           api::types::v1::BuilderConfig cfg,
-                           const QDir &cacheDir);
+    explicit SourceFetcher(api::types::v1::BuilderProjectSource source, const QDir &cacheDir);
 
     auto fetch(QDir destination) noexcept -> utils::error::Result<void>;
+
+    void setCommand(std::shared_ptr<utils::Cmd> cmd) { this->m_cmd = cmd; }
 
 private:
     QString getSourceName();
     QDir cacheDir;
     api::types::v1::BuilderProjectSource source;
-    api::types::v1::BuilderConfig cfg;
+    std::shared_ptr<utils::Cmd> m_cmd = std::make_shared<utils::Cmd>("sh");
 };
 
 } // namespace linglong::builder
-
-#endif // LINGLONG_SRC_BUILDER_SOURCE_FETCHER_H_

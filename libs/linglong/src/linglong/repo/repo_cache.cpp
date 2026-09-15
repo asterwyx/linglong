@@ -1,0 +1,378 @@
+/*
+ * SPDX-FileCopyrightText: 2024 - 2026 UnionTech Software Technology Co., Ltd.
+ *
+ * SPDX-License-Identifier: LGPL-3.0-or-later
+ */
+
+#include "repo_cache.h"
+
+#include "configure.h"
+#include "linglong/common/formatter.h"
+#include "linglong/package/version.h"
+#include "linglong/utils/file.h"
+#include "linglong/utils/log/log.h"
+#include "linglong/utils/serialize/json.h"
+#include "linglong/utils/serialize/packageinfo_handler.h"
+
+#include <fstream>
+#include <iostream>
+
+namespace linglong::repo {
+
+RepoCache::RepoCache(std::filesystem::path cacheFile)
+    : cacheFile(std::move(cacheFile))
+{
+    this->cache.llVersion = LINGLONG_VERSION;
+    this->cache.version = cacheFileVersion;
+}
+
+utils::error::Result<void> RepoCache::load()
+{
+    LINGLONG_TRACE("load repo cache");
+
+    std::error_code ec;
+    if (!std::filesystem::exists(this->cacheFile, ec)) {
+        if (ec) {
+            return LINGLONG_ERR("checking cache file existence failed", ec);
+        }
+        return LINGLONG_ERR("cache file does not exist");
+    }
+
+    auto result = utils::serialize::LoadJSONFile<api::types::v1::RepositoryCache>(this->cacheFile);
+    if (!result) {
+        return LINGLONG_ERR(fmt::format("failed to load cache file: {}", result.error()));
+    }
+
+    if (result->version != cacheFileVersion) {
+        return LINGLONG_ERR(
+          fmt::format("cache version mismatch: cache version {}, expected version {}",
+                      result->version,
+                      cacheFileVersion));
+    }
+    this->cache = std::move(result).value();
+
+    return LINGLONG_OK;
+}
+
+utils::error::Result<void> RepoCache::updateConfig(const api::types::v1::RepoConfigV2 &config)
+{
+    LINGLONG_TRACE("update repo cache config");
+
+    auto originalConfig = cache.config;
+    cache.config = config;
+    auto result = writeToDisk();
+    if (!result) {
+        cache.config = std::move(originalConfig);
+        return LINGLONG_ERR(result);
+    }
+
+    return LINGLONG_OK;
+}
+
+utils::error::Result<void> RepoCache::rebuild(const api::types::v1::RepoConfigV2 &repoConfig,
+                                              OstreeRepo &repo) noexcept
+{
+    LINGLONG_TRACE("rebuild repo cache");
+
+    this->cache.config = repoConfig;
+    this->cache.layers.clear();
+
+    g_autoptr(GHashTable) refsTable = nullptr;
+    g_autoptr(GError) gErr = nullptr;
+    std::vector<std::string_view> refs;
+
+    if (ostree_repo_list_refs(&repo, nullptr, &refsTable, nullptr, &gErr) == FALSE) {
+        return LINGLONG_ERR(fmt::format("ostree_repo_list_refs {}", ptr_view(gErr)));
+    }
+
+    // we couldn't report error within below lambda and for_each wouldn't return early if error
+    // occurred, copy refs out
+    g_hash_table_foreach(
+      refsTable,
+      [](gpointer key, [[maybe_unused]] gpointer value, gpointer data) {
+          // key,value -> ref,checksum
+          auto *vec = static_cast<std::vector<std::string_view> *>(data);
+          vec->emplace_back(static_cast<const char *>(key));
+      },
+      &refs);
+
+    for (auto ref : refs) {
+        auto pos = ref.find(':');
+        if (pos == std::string::npos) {
+            LogW("invalid ref: {}", ref.data());
+            continue;
+        }
+
+        api::types::v1::RepositoryCacheLayersItem item;
+        item.repo = ref.substr(0, pos);
+
+        g_autofree char *commit{ nullptr };
+        g_autoptr(GError) gErr{ nullptr };
+        g_autoptr(GFile) root{ nullptr };
+        if (ostree_repo_read_commit(&repo, ref.data(), &root, &commit, nullptr, &gErr) == FALSE) {
+            LogW("ostree_repo_read_commit failed: {}", ptr_view(gErr));
+            continue;
+        }
+        item.commit = commit;
+
+        // ostree ls --repo repo ref, the file path of info.json is /info.json.
+        g_autoptr(GFile) infoFile = g_file_resolve_relative_path(root, "info.json");
+        g_clear_error(&gErr);
+        g_autofree gchar *content = nullptr;
+        if (!g_file_load_contents(infoFile, nullptr, &content, nullptr, nullptr, &gErr)) {
+            LogE("skip broken ref {}, failed to load info.json: {}", ref, ptr_view(gErr));
+            continue;
+        }
+        auto info = utils::serialize::parsePackageInfo(content);
+        if (!info) {
+            LogW("invalid info.json on ref {}: {}", ref, info.error());
+            continue;
+        }
+
+        item.info = std::move(info).value();
+        this->cache.layers.emplace_back(std::move(item));
+    }
+
+    auto ret = writeToDisk();
+    if (!ret) {
+        return LINGLONG_ERR(ret);
+    }
+
+    return LINGLONG_OK;
+}
+
+utils::error::Result<void>
+RepoCache::addLayerItem(const api::types::v1::RepositoryCacheLayersItem &item)
+{
+    LINGLONG_TRACE("add layer item");
+
+    auto it = findMatchingItem(item);
+    if (it) {
+        return LINGLONG_ERR("item already exist");
+    }
+
+    cache.layers.emplace_back(item);
+    auto ret = writeToDisk();
+    if (!ret) {
+        return LINGLONG_ERR(ret);
+    }
+
+    return LINGLONG_OK;
+}
+
+utils::error::Result<std::vector<api::types::v1::RepositoryCacheLayersItem>::iterator>
+RepoCache::findMatchingItem(const api::types::v1::RepositoryCacheLayersItem &item) noexcept
+{
+    LINGLONG_TRACE("find matching item");
+    auto it = std::find_if(
+      cache.layers.begin(),
+      cache.layers.end(),
+      [&item](const api::types::v1::RepositoryCacheLayersItem &val) {
+          return !(item.commit != val.commit || item.repo != val.repo
+                   || item.info.channel != val.info.channel || item.info.id != val.info.id
+                   || item.info.version != val.info.version
+                   || item.info.arch.front() != val.info.arch.front()
+                   || item.info.packageInfoV2Module != val.info.packageInfoV2Module);
+      });
+
+    if (it == cache.layers.end()) {
+        return LINGLONG_ERR("item doesn't exist");
+    }
+
+    return it;
+}
+
+utils::error::Result<void>
+RepoCache::deleteLayerItem(const api::types::v1::RepositoryCacheLayersItem &item) noexcept
+{
+    LINGLONG_TRACE("delete layer item");
+
+    auto it = findMatchingItem(item);
+    if (!it) {
+        return LINGLONG_ERR(it);
+    }
+
+    cache.layers.erase(*it);
+    auto ret = writeToDisk();
+    if (!ret) {
+        return LINGLONG_ERR(ret);
+    }
+
+    return LINGLONG_OK;
+}
+
+std::vector<api::types::v1::RepositoryCacheLayersItem>
+RepoCache::queryExistingLayerItem() const noexcept
+{
+    auto layers = this->cache.layers;
+    auto it = std::remove_if(layers.begin(),
+                             layers.end(),
+                             [](const api::types::v1::RepositoryCacheLayersItem &item) {
+                                 return item.deleted.has_value() && item.deleted.value();
+                             });
+    layers.erase(it, layers.end());
+
+    return layers;
+}
+
+std::vector<api::types::v1::RepositoryCacheLayersItem>
+RepoCache::queryLayerItem(const repoCacheQuery &query) const noexcept
+{
+    using itemRef = std::reference_wrapper<const api::types::v1::RepositoryCacheLayersItem>;
+    std::vector<itemRef> layers_view;
+    for (const auto &layer : cache.layers) {
+        if (query.id && query.id.value() != layer.info.id) {
+            continue;
+        }
+
+        if (query.repo && query.repo.value() != layer.repo) {
+            continue;
+        }
+
+        if (query.channel && query.channel.value() != layer.info.channel) {
+            continue;
+        }
+
+        if (query.version && query.version.value() != layer.info.version) {
+            continue;
+        }
+
+        if (query.module && query.module.value() != layer.info.packageInfoV2Module) {
+            continue;
+        }
+
+        if (query.architecture && query.architecture.value() != layer.info.arch.front()) {
+            continue;
+        }
+
+        if (query.deleted) {
+            auto layerDeleted = layer.deleted.value_or(false);
+            if (query.deleted.value() != layerDeleted) {
+                continue;
+            }
+        }
+
+        layers_view.emplace_back(layer);
+    }
+
+    std::sort(layers_view.begin(), layers_view.end(), [](itemRef lhs, itemRef rhs) {
+        auto lhsVersion = linglong::package::Version::parse(lhs.get().info.version.c_str());
+        if (!lhsVersion) {
+            LogE("Failed to parse lhs version: {}", lhs.get().info.version);
+            return false;
+        }
+        auto rhsVersion = linglong::package::Version::parse(rhs.get().info.version.c_str());
+        if (!rhsVersion) {
+            LogE("Failed to parse rhs version: {}", rhs.get().info.version);
+            return false;
+        }
+        return *lhsVersion > *rhsVersion;
+    });
+
+    return { layers_view.cbegin(), layers_view.cend() };
+}
+
+utils::error::Result<void> RepoCache::updateMergedItems(
+  const std::vector<api::types::v1::RepositoryCacheMergedItem> &items) noexcept
+{
+    LINGLONG_TRACE("update merged items");
+    cache.merged = items;
+    auto ret = writeToDisk();
+    if (!ret) {
+        return LINGLONG_ERR(ret);
+    }
+    return LINGLONG_OK;
+};
+
+utils::error::Result<void> RepoCache::writeToDisk()
+{
+    LINGLONG_TRACE("save repo cache");
+
+    std::error_code ec;
+    auto parent_path = this->cacheFile.parent_path();
+    if (!std::filesystem::exists(parent_path, ec)) {
+        return LINGLONG_ERR("The parent directory of state.json doesn't exist", ec);
+    }
+
+    auto dumpStatus = [](const std::filesystem::path &p, std::error_code &ec) {
+        auto status = std::filesystem::status(p, ec);
+        if (ec) {
+            return;
+        }
+        auto targetPerm = status.permissions();
+
+        using std::filesystem::perms;
+        auto show = [targetPerm](char op, perms perm) {
+            return perms::none == (perm & targetPerm) ? '-' : op;
+        };
+        LogI("{}: {}{}{}{}{}{}{}{}{}",
+             p.string(),
+             show('r', perms::owner_read),
+             show('w', perms::owner_write),
+             show('x', perms::owner_exec),
+             show('r', perms::group_read),
+             show('w', perms::group_write),
+             show('x', perms::group_exec),
+             show('r', perms::others_read),
+             show('w', perms::others_write),
+             show('x', perms::others_exec));
+        ec.clear();
+    };
+
+    auto tmpFile = parent_path / ("temp-" + this->cacheFile.filename().string());
+    auto ofs = std::ofstream(tmpFile);
+    if (!ofs.is_open()) { // dump all info
+        LogI("process uid {}, process gid {}", ::getuid(), ::getgid());
+        dumpStatus(parent_path, ec);
+        if (ec) {
+            LogE("get status of directory {} error: {}", parent_path.string(), ec.message());
+        }
+        return LINGLONG_ERR("failed to update cache");
+    }
+
+    auto data = nlohmann::json(this->cache).dump();
+    ofs << data;
+    ofs.close();
+    if (!ofs) {
+        std::filesystem::remove(tmpFile, ec);
+        return LINGLONG_ERR("failed to write cache");
+    }
+
+    std::filesystem::rename(tmpFile, this->cacheFile, ec);
+    if (ec) {
+        LogE("failed to rename from {} to {}: {}",
+             tmpFile.string(),
+             this->cacheFile.string(),
+             ec.message());
+        // dump status of original file
+        if (std::filesystem::exists(this->cacheFile, ec)) {
+            dumpStatus(this->cacheFile, ec);
+            if (ec) {
+                LogE("failed to get status of file {}: {}", this->cacheFile.string(), ec.message());
+                ec.clear();
+            }
+        }
+        if (ec) {
+            LogE("couldn't check the existence of {}: {}", this->cacheFile.c_str(), ec.message());
+            ec.clear();
+        }
+
+        std::filesystem::remove(tmpFile, ec);
+        if (ec) {
+            LogE("failed to remove file {}: {}", tmpFile.string(), ec.message());
+        }
+
+        return LINGLONG_ERR("failed to update cache");
+    }
+
+    auto versionTag = parent_path / ".version";
+    auto versionWritten = utils::writeFile(versionTag, LINGLONG_VERSION);
+    if (!versionWritten) {
+        LogE("failed to write file {}: {}", versionTag.string(), versionWritten.error());
+        return LINGLONG_OK;
+    }
+
+    return LINGLONG_OK;
+}
+
+} // namespace linglong::repo

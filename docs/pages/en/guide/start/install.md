@@ -4,60 +4,273 @@ SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 
-# Install linglong
+# Install Linyaps
 
-Linglong is composed of three parts.
+Some deepin and UOS releases already include Linyaps. Run `ll-cli --version`
+first; if the command is available, you can continue to
+[Quick Start](./quick-start.md). The installer below will
+update an existing installation when a newer package is available.
 
-- ll-builder is used to build and debug Linglong applications, provided by linglong-builder.
-- ll-box is a sandbox container, provided by linglong-box.
-- ll-cli manages and runs Linglong applications, provided by linglong-bin.
+The main command-line tools are:
 
-## deepin v23
+- `ll-cli` manages and runs Linyaps applications and is provided by
+  `linglong-bin`.
+- `ll-builder` builds and debugs Linyaps applications and is provided by
+  `linglong-builder`.
 
-```bash
-sudo apt install linglong-builder linglong-box linglong-bin
+:::warning Storage filesystem
+
+The local Linyaps repository uses OSTree, which currently has severe write
+performance problems on ZFS. Do not place Linyaps repository or data
+directories on a ZFS filesystem; use another Linux filesystem such as ext4 or
+XFS instead. See [Issue #1107](https://github.com/OpenAtom-Linyaps/linyaps/issues/1107)
+and [OpenZFS #11140](https://github.com/openzfs/zfs/issues/11140) for context.
+
+:::
+
+## Repository usage
+
+### Release repository
+
+This repository is built automatically from the latest release tag:
+
+1. Repository: <https://ci.deepin.com/repo/obs/linglong:/CI:/release>
+2. Build status: <https://build.deepin.com/project/show/linglong:CI:release>
+
+### Latest repository
+
+This repository is built automatically from the latest commit:
+
+1. Repository: <https://ci.deepin.com/repo/obs/linglong:/CI:/latest>
+2. Build status: <https://build.deepin.com/project/show/linglong:CI:latest>
+
+:::tip
+
+The following installation steps use the stable `release` repository. To test
+unreleased changes, replace `release` with `latest` in an OBS repository URL.
+The `latest` repository may contain incomplete changes and is not recommended
+for production systems.
+
+:::
+
+## Install or update automatically
+
+Review the script before running it, then install Linyaps with:
+
+```sh
+curl -fsSL https://get.linyaps.org.cn | sh
 ```
 
-## UOS 1070
+The script uses the distribution's native package when it is tracked by the
+[Packaging status](https://repology.org/project/linyaps/versions) link on the
+project home page (Arch Linux, Manjaro, Parabola Linux, and AOSC OS). For the
+other distributions listed below, it configures the official Linyaps release
+repository. Running the command again refreshes package metadata and updates an
+existing installation.
 
-add Linglong repository source
+The repositories below currently use HTTPS transport without package-signing
+metadata. The script therefore configures the same trust policy as the manual
+commands (`trusted=yes` for APT and `gpgcheck=0` for DNF).
 
-```bash
-echo "deb [trusted=yes] https://ci.deepin.com/repo/deepin/deepin-community/linglong-repo/ unstable main" | sudo tee -a /etc/apt/sources.list
+NixOS is intentionally excluded from the automatic path because its system
+configuration is declarative. The script detects NixOS and prints the required
+configuration instead of modifying it.
+
+## Install or update manually
+
+### Arch / Manjaro / Parabola Linux
+
+```sh
+sudo pacman -Syu --needed linyaps
 ```
 
+Linyaps web store installer needs to be installed through [AUR repository](https://aur.archlinux.org/packages/linyaps-web-store-installer) or [self-built repository](https://github.com/taotieren/aur-repo).
+
 ```bash
+# AUR
+yay -Syu linyaps-web-store-installer
+# or self-built source
+sudo pacman -Syu linyaps-web-store-installer
+```
+
+### deepin 25
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Deepin_25/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
 sudo apt update
-sudo apt install linglong-builder linglong-box linglong-bin
+sudo apt install linglong-bin linglong-installer
 ```
 
-## OpenEuler
+### deepin 23
 
-add Linglong repository source
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Deepin_23/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Fedora 42
+
+```sh
+sudo dnf config-manager addrepo --from-repofile "https://ci.deepin.com/repo/obs/linglong:/CI:/release/Fedora_42/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### Fedora 43
+
+```sh
+sudo dnf config-manager addrepo --from-repofile "https://ci.deepin.com/repo/obs/linglong:/CI:/release/Fedora_43/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### Ubuntu 24.04
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/xUbuntu_24.04/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Ubuntu 25.04
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_25.04/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Ubuntu 25.10
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_25.10/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Debian 12
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Debian_12/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Debian 13
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Debian_13/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### openEuler 24.03
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/openEuler_24.03/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### openEuler 25.03
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/openEuler_25.03/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### UOS 1070
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/uos_1070/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Anolis OS 23.3
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/AnolisOS_23.3/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### Anolis OS 23.4
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/AnolisOS_23.4/linglong%3ACI%3Arelease.repo"
+sudo sh -c "printf '\ngpgcheck=0\n' >> '/etc/yum.repos.d/linglong%3ACI%3Arelease.repo'"
+sudo dnf makecache --refresh
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### openKylin 2.0
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/openkylin_2.0/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### AOSC OS
+
+```sh
+sudo oma refresh
+sudo oma install linyaps
+```
+
+### NixOS
+
+On NixOS 25.11 or later, add the following option to the system configuration
+(usually `/etc/nixos/configuration.nix`):
+
+```nix
+services.linyaps.enable = true;
+```
+
+Then install or update Linyaps by rebuilding the system:
+
+```sh
+sudo nixos-rebuild switch --upgrade
+```
+
+## Install the Linyaps build tool
+
+### Debian-based
 
 ```bash
-sudo curl -o /etc/yum.repos.d/linglong.repo -L https://eur.openeuler.openatom.cn/coprs/kamiyadm/linglong/repo/openeuler-24.03_LTS/kamiyadm-linglong-openeuler-24.03_LTS.repo
+sudo apt install linglong-builder
 ```
 
+### RPM-based
+
+```bash
+sudo dnf install linglong-builder
 ```
-sudo dnf update
-sudo dnf install linglong-builder linglong-box linglong-bin
-```
 
-# Install the Pica tool
+## Install the Linyaps conversion tool
 
-This tool currently provides the capability to convert DEB packages into Linglong packages. Generate the required `linglong.yaml` file for building Linglong applications and rely on `ll-builder` to implement application build and export.
-
-## deepin v23
+### Deepin 23/25
 
 ```bash
 sudo apt install linglong-pica
 ```
 
-## UOS 1070
+### Arch Linux
 
-The repository source needs to be added, which has been done previously.
+Install via [AUR repository](https://aur.archlinux.org/packages/linglong-pica) or [self-hosted repository](https://github.com/taotieren/aur-repo).
 
 ```bash
-sudo apt install linglong-pica
+# AUR
+yay -Syu linglong-pica
+
+# or self-hosted repository
+sudo pacman -Syu linglong-pica
 ```

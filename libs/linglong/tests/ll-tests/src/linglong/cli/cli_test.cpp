@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2025 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
@@ -7,219 +7,900 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "linglong/api/dbus/v1/mock_package_manager.h"
+#include "../../common/tempdir.h"
+#include "linglong/api/types/v1/Generators.hpp"
 #include "linglong/cli/cli.h"
-#include "linglong/cli/dbus_reply.h"
-#include "linglong/cli/mock_printer.h"
-#include "linglong/dbus_ipc/reply.h"
-#include "linglong/package_manager/mock_package_manager.h"
-#include "linglong/utils/error/error.h"
-#include "linglong/utils/finally/finally.h"
+#include "linglong/cli/cli_printer.h"
+#include "linglong/cli/dummy_notifier.h"
+#include "linglong/cli/printer.h"
+#include "ocppi/cli/crun/Crun.hpp"
 
-#include <docopt.h>
+#include <filesystem>
+#include <fstream>
 
-#include <iostream>
-
-#include <wordexp.h>
-
-namespace linglong::cli::test {
+using namespace linglong;
+using ::testing::_;
+using ::testing::ElementsAre;
+using ::testing::HasSubstr;
+using ::testing::InSequence;
+using ::testing::Invoke;
+using ::testing::IsEmpty;
+using ::testing::Return;
 
 namespace {
 
-std::map<std::string, docopt::value> parseCommand(const QString &command)
+class MockRepo : public repo::OSTreeRepo
 {
-    int argc = 0;
-    char **argv = nullptr;
-    auto words = command.toStdString();
-    wordexp_t exp{};
-    wordexp(words.c_str(), &exp, 0);
-    auto defer = utils::finally::finally([&exp]() {
-        wordfree(&exp);
-    });
+public:
+    MockRepo(const std::filesystem::path &path)
+        : repo::OSTreeRepo(
+            path, api::types::v1::RepoConfigV2{ .defaultRepo = "", .repos = {}, .version = 2 })
+    {
+    }
 
-    argc = (int)exp.we_wordc;
-    argv = exp.we_wordv;
-    auto args = docopt::docopt(Cli::USAGE,
-                               { argv + 1, argv + argc },
-                               false,                 // show help if requested
-                               "linglong CLI 1.4.0"); // version string
-    return args;
+    std::filesystem::path defaultSharedDir() const noexcept { return this->getDefaultSharedDir(); }
+
+    std::filesystem::path overlaySharedDir() const noexcept { return this->getOverlayShareDir(); }
+
+    MOCK_METHOD(utils::error::Result<std::vector<api::types::v1::PackageInfoV2>>,
+                listLocal,
+                (),
+                (override, const, noexcept));
+    MOCK_METHOD(utils::error::Result<package::Reference>,
+                clearReferenceLocal,
+                (const package::FuzzyReference &fuzzyRef, bool semanticMatching),
+                (override, const, noexcept));
+    MOCK_METHOD(utils::error::Result<api::types::v1::RepositoryCacheLayersItem>,
+                getLayerItem,
+                (const package::Reference &ref, std::string module),
+                (override, const, noexcept));
+    MOCK_METHOD(utils::error::Result<package::ReferenceWithRepo>,
+                latestRemoteReference,
+                (const package::FuzzyReference &fuzzyRef),
+                (override, const, noexcept));
+};
+
+class MockPrinter : public cli::CLIPrinter
+{
+public:
+    MOCK_METHOD(void, printErr, (const utils::error::Error &error), (override));
+    MOCK_METHOD(void,
+                printUpgradeList,
+                (std::vector<api::types::v1::UpgradeListResult> &),
+                (override));
+    MOCK_METHOD(void, printContent, (const QStringList &filePaths), (override));
+    MOCK_METHOD(void, printProgress, (double percentage, const std::string &message), (override));
+    MOCK_METHOD(void, printMessage, (const std::string &message), (override));
+    MOCK_METHOD(void, clearLine, (), (override));
+};
+
+class MockCli : public cli::Cli
+{
+public:
+    using cli::Cli::Cli;
+
+    MOCK_METHOD(utils::error::Result<repo::OSTreeRepo *>, getRepo, (bool), (override, noexcept));
+    MOCK_METHOD(utils::error::Result<api::dbus::v1::PackageManager *>, getPkgMan, (), (override));
+};
+
+class RepoAndPackageManagerCli : public cli::Cli
+{
+public:
+    using cli::Cli::Cli;
+
+    utils::error::Result<repo::OSTreeRepo *> callGetRepo(bool forceReload = false) noexcept
+    {
+        return cli::Cli::getRepo(forceReload);
+    }
+
+    utils::error::Result<void> callInitializeRepo() noexcept { return cli::Cli::initializeRepo(); }
+
+    utils::error::Result<api::dbus::v1::PackageManager *> callGetPkgMan()
+    {
+        return cli::Cli::getPkgMan();
+    }
+
+    MOCK_METHOD(utils::error::Result<std::unique_ptr<repo::OSTreeRepo>>,
+                loadRepoFromPath,
+                (const std::filesystem::path &repoRoot),
+                (override, noexcept));
+    MOCK_METHOD(utils::error::Result<void>, initializeRepo, (), (override, noexcept));
+    MOCK_METHOD(utils::error::Result<api::dbus::v1::PackageManager *>, getPkgMan, (), (override));
+    MOCK_METHOD(utils::error::Result<std::unique_ptr<api::dbus::v1::PackageManager>>,
+                initializePeerModePackageManager,
+                (),
+                (override));
+    MOCK_METHOD(utils::error::Result<std::unique_ptr<api::dbus::v1::PackageManager>>,
+                initializeDBusPackageManager,
+                (),
+                (override));
+};
+
+utils::error::Result<std::unique_ptr<repo::OSTreeRepo>>
+makeLoadRepoError(const std::string &message)
+{
+    LINGLONG_TRACE("make load repo error");
+
+    return LINGLONG_ERR(message);
 }
 
-} // namespace
+utils::error::Result<void> makeVoidError(const std::string &message)
+{
+    LINGLONG_TRACE("make void error");
 
-using ::testing::StrictMock;
+    return LINGLONG_ERR(message);
+}
 
-class CLITest : public ::testing::Test
+utils::error::Result<api::dbus::v1::PackageManager *>
+makePackageManagerError(const std::string &message)
+{
+    LINGLONG_TRACE("make package manager error");
+
+    return LINGLONG_ERR(message);
+}
+
+utils::error::Result<std::unique_ptr<api::dbus::v1::PackageManager>>
+makePackageManagerInitializationError(const std::string &message)
+{
+    LINGLONG_TRACE("make package manager initialization error");
+
+    return LINGLONG_ERR(message);
+}
+
+class CliTest : public ::testing::Test
 {
 protected:
-    std::unique_ptr<StrictMock<MockAppManager>> appMan;
-    std::shared_ptr<StrictMock<api::dbus::v1::test::MockPackageManager>> pkgMan;
-    std::unique_ptr<StrictMock<MockPrinter>> printer;
-    std::unique_ptr<Cli> cli;
-
-    static void SetUpTestSuite() { registerDBusParam(); }
-
     void SetUp() override
     {
-        printer = std::make_unique<StrictMock<MockPrinter>>();
-        appMan = std::make_unique<StrictMock<MockAppManager>>();
-        pkgMan = std::make_shared<StrictMock<api::dbus::v1::test::MockPackageManager>>(
-          "org.deepin.linglong.AppManager",
-          "/org/deepin/linglong/AppManager",
-          QDBusConnection::sessionBus());
-
-        cli = std::make_unique<Cli>(*printer, *appMan, pkgMan);
+        printer = std::make_unique<MockPrinter>();
+        tempDir = std::make_unique<TempDir>();
+        ociCLI = ocppi::cli::crun::Crun::New(tempDir->path()).value();
+        containerBuilder = std::make_unique<runtime::ContainerBuilder>(*ociCLI);
+        repo = std::make_unique<MockRepo>(tempDir->path());
+        auto notifier = std::make_unique<cli::DummyNotifier>();
+        cli = std::make_unique<::testing::NiceMock<MockCli>>(*printer,
+                                                             *ociCLI,
+                                                             *containerBuilder,
+                                                             false,
+                                                             std::move(notifier),
+                                                             nullptr);
+        ON_CALL(*cli, getRepo(testing::_))
+          .WillByDefault(Invoke([this](bool) -> utils::error::Result<repo::OSTreeRepo *> {
+              return repo.get();
+          }));
     }
 
     void TearDown() override
     {
-        appMan = nullptr;
-        pkgMan = nullptr;
-        printer = nullptr;
+        cli.reset();
+        printer.reset();
+        ociCLI.reset();
+        containerBuilder.reset();
+        repo.reset();
+        tempDir.reset();
     }
+
+    std::unique_ptr<MockPrinter> printer;
+    std::unique_ptr<TempDir> tempDir;
+    std::unique_ptr<ocppi::cli::crun::Crun> ociCLI;
+    std::unique_ptr<runtime::ContainerBuilder> containerBuilder;
+    std::unique_ptr<MockRepo> repo;
+    std::unique_ptr<::testing::NiceMock<MockCli>> cli;
 };
 
-using ::testing::Return;
-
-TEST_F(CLITest, Run)
+class CliRepoAndPackageManagerTest : public ::testing::Test
 {
-    auto args = parseCommand("ll-cli run com.163.music");
+protected:
+    void SetUp() override
+    {
+        printer = std::make_unique<MockPrinter>();
+        tempDir = std::make_unique<TempDir>();
+        ociCLI = ocppi::cli::crun::Crun::New(tempDir->path()).value();
+        containerBuilder = std::make_unique<runtime::ContainerBuilder>(*ociCLI);
+        cli = makeCli(false);
+    }
 
-    EXPECT_CALL(*appMan, Run)
-      .Times(1)
-      .WillOnce([](const linglong::service::RunParamOption &paramOption)
-                  -> linglong::utils::error::Result<void> {
-          return LINGLONG_OK;
+    std::unique_ptr<repo::OSTreeRepo> makeRepo(const std::filesystem::path &path)
+    {
+        return std::make_unique<MockRepo>(path);
+    }
+
+    std::unique_ptr<RepoAndPackageManagerCli> makeCli(bool peerMode)
+    {
+        auto notifier = std::make_unique<cli::DummyNotifier>();
+        return std::make_unique<RepoAndPackageManagerCli>(*printer,
+                                                          *ociCLI,
+                                                          *containerBuilder,
+                                                          peerMode,
+                                                          std::move(notifier),
+                                                          nullptr);
+    }
+
+    std::unique_ptr<MockPrinter> printer;
+    std::unique_ptr<TempDir> tempDir;
+    std::unique_ptr<ocppi::cli::crun::Crun> ociCLI;
+    std::unique_ptr<runtime::ContainerBuilder> containerBuilder;
+    std::unique_ptr<RepoAndPackageManagerCli> cli;
+};
+
+TEST_F(CliTest, installRejectsMissingExplicitLocalPath)
+{
+    const auto packagePath = tempDir->path() / "net.example_1.0_x86_64_binary";
+
+    EXPECT_CALL(*cli, getPkgMan()).Times(0);
+    EXPECT_CALL(*printer, printErr(_))
+      .WillOnce(Invoke([&packagePath](const utils::error::Error &error) {
+          EXPECT_EQ(error.code(), static_cast<int>(utils::error::ErrorCode::Failed));
+          EXPECT_THAT(error.message(), HasSubstr(packagePath.string()));
+          EXPECT_THAT(error.message(), HasSubstr("does not exist"));
+      }));
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = packagePath.string() }), -1);
+}
+
+TEST_F(CliTest, installRejectsLocalDirectoryBeforeParsingReference)
+{
+    const auto packagePath = tempDir->path() / "net.example_1.0_x86_64_binary";
+    ASSERT_TRUE(std::filesystem::create_directory(packagePath));
+
+    EXPECT_CALL(*cli, getPkgMan()).Times(0);
+    EXPECT_CALL(*printer, printErr(_))
+      .WillOnce(Invoke([&packagePath](const utils::error::Error &error) {
+          EXPECT_EQ(error.code(),
+                    static_cast<int>(utils::error::ErrorCode::AppInstallUnsupportedFileFormat));
+          EXPECT_THAT(error.message(), HasSubstr(packagePath.string()));
+          EXPECT_THAT(error.message(), HasSubstr("not a regular file"));
+      }));
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = packagePath.string() }), -1);
+}
+
+TEST_F(CliTest, installRejectsUnsupportedLocalFileBeforeContactingPackageManager)
+{
+    const auto packagePath = tempDir->path() / "net.example_1.0_x86_64_binary";
+    std::ofstream(packagePath) << "not a package";
+
+    EXPECT_CALL(*cli, getPkgMan()).Times(0);
+    EXPECT_CALL(*printer, printErr(_))
+      .WillOnce(Invoke([&packagePath](const utils::error::Error &error) {
+          EXPECT_EQ(error.code(),
+                    static_cast<int>(utils::error::ErrorCode::AppInstallUnsupportedFileFormat));
+          EXPECT_THAT(error.message(), HasSubstr(packagePath.string()));
+          EXPECT_THAT(error.message(), HasSubstr("Unsupported file format"));
+      }));
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = packagePath.string() }), -1);
+}
+
+TEST_F(CliTest, installKeepsRemoteVersionReference)
+{
+    EXPECT_CALL(*cli, getPkgMan())
+      .WillOnce(Invoke([]() -> utils::error::Result<api::dbus::v1::PackageManager *> {
+          return makePackageManagerError("package manager unavailable");
+      }));
+    EXPECT_CALL(*printer, printErr(_)).WillOnce(Invoke([](const utils::error::Error &error) {
+        EXPECT_THAT(error.message(), HasSubstr("package manager unavailable"));
+    }));
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = "org.example.App/1.0.0" }), -1);
+}
+
+TEST_F(CliTest, installKeepsRemoteReferencesEndingWithPackageFileSuffix)
+{
+    EXPECT_CALL(*cli, getPkgMan())
+      .Times(2)
+      .WillRepeatedly(Invoke([]() -> utils::error::Result<api::dbus::v1::PackageManager *> {
+          return makePackageManagerError("package manager unavailable");
+      }));
+    EXPECT_CALL(*printer, printErr(_)).Times(2);
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = "org.example.layer" }), -1);
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = "org.example.uab/1.0.0" }), -1);
+}
+
+TEST_F(CliTest, installRecognizesExistingLayerFile)
+{
+    const auto packagePath = tempDir->path() / "net.example_1.0_x86_64_binary.layer";
+    std::ofstream(packagePath) << "layer placeholder";
+
+    EXPECT_CALL(*cli, getPkgMan())
+      .WillOnce(Invoke([]() -> utils::error::Result<api::dbus::v1::PackageManager *> {
+          return makePackageManagerError("package manager unavailable");
+      }));
+    EXPECT_CALL(*printer, printErr(_)).WillOnce(Invoke([](const utils::error::Error &error) {
+        EXPECT_THAT(error.message(), HasSubstr("package manager unavailable"));
+    }));
+
+    EXPECT_EQ(cli->install(cli::InstallOptions{ .appid = packagePath.string() }), -1);
+}
+
+TEST_F(CliTest, taskEventsDriveProgressAndTextOutput)
+{
+    EXPECT_CALL(*printer, printProgress(testing::DoubleEq(42.0), "fetching"));
+    EXPECT_TRUE(
+      QMetaObject::invokeMethod(cli.get(),
+                                "onTaskEvent",
+                                Qt::DirectConnection,
+                                Q_ARG(QString, QStringLiteral("state")),
+                                Q_ARG(QVariantMap,
+                                      common::serialize::toQVariantMap(api::types::v1::TaskState{
+                                        .message = "fetching",
+                                        .progress = 42.0,
+                                        .state = api::types::v1::State::Processing,
+                                      }))));
+
+    EXPECT_CALL(*printer, printMessage("a standalone message"));
+    EXPECT_TRUE(QMetaObject::invokeMethod(
+      cli.get(),
+      "onTaskEvent",
+      Qt::DirectConnection,
+      Q_ARG(QString, QStringLiteral("message")),
+      Q_ARG(
+        QVariantMap,
+        QVariantMap({ { QStringLiteral("message"), QStringLiteral("a standalone message") } }))));
+}
+
+TEST_F(CliTest, taskFinishedDrivesFinalOutput)
+{
+    EXPECT_CALL(*printer, printProgress(_, _)).Times(0);
+    EXPECT_TRUE(
+      QMetaObject::invokeMethod(cli.get(),
+                                "onTaskEvent",
+                                Qt::DirectConnection,
+                                Q_ARG(QString, QStringLiteral("state")),
+                                Q_ARG(QVariantMap,
+                                      common::serialize::toQVariantMap(api::types::v1::TaskState{
+                                        .message = "",
+                                        .progress = 0.0,
+                                        .state = api::types::v1::State::Succeed,
+                                      }))));
+
+    EXPECT_CALL(*printer, clearLine());
+    EXPECT_CALL(*printer, printMessage("installed"));
+    const auto result = common::serialize::toQVariantMap(api::types::v1::CommonResult{
+      .code = 0,
+      .message = "installed",
+    });
+    EXPECT_TRUE(QMetaObject::invokeMethod(cli.get(),
+                                          "onTaskFinished",
+                                          Qt::DirectConnection,
+                                          Q_ARG(QVariantMap, result)));
+}
+
+TEST_F(CliTest, failedTaskStateDoesNotPrintErrorAsProgress)
+{
+    EXPECT_CALL(*printer, printProgress(_, _)).Times(0);
+    EXPECT_TRUE(
+      QMetaObject::invokeMethod(cli.get(),
+                                "onTaskEvent",
+                                Qt::DirectConnection,
+                                Q_ARG(QString, QStringLiteral("state")),
+                                Q_ARG(QVariantMap,
+                                      common::serialize::toQVariantMap(api::types::v1::TaskState{
+                                        .message = "installation failed",
+                                        .progress = 42.0,
+                                        .state = api::types::v1::State::Failed,
+                                      }))));
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getRepoCachesLoadedRepository)
+{
+    repo::OSTreeRepo *loadedRepo = nullptr;
+
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([&](const std::filesystem::path &path)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          auto repo = makeRepo(path);
+          loadedRepo = repo.get();
+          return repo;
+      }));
+    EXPECT_CALL(*cli, initializeRepo()).Times(0);
+
+    auto first = cli->callGetRepo();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, loadedRepo);
+
+    auto second = cli->callGetRepo();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(*second, loadedRepo);
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getRepoForceReloadReloadsRepository)
+{
+    repo::OSTreeRepo *firstRepo = nullptr;
+    repo::OSTreeRepo *secondRepo = nullptr;
+
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([&](const std::filesystem::path &path)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          auto repo = makeRepo(path);
+          firstRepo = repo.get();
+          return repo;
+      }))
+      .WillOnce(Invoke([&](const std::filesystem::path &path)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          auto repo = makeRepo(path);
+          secondRepo = repo.get();
+          return repo;
+      }));
+    EXPECT_CALL(*cli, initializeRepo()).Times(0);
+
+    auto first = cli->callGetRepo();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, firstRepo);
+
+    auto second = cli->callGetRepo(true);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(*second, secondRepo);
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getRepoInitializesAndReloadsWhenInitialLoadFails)
+{
+    repo::OSTreeRepo *loadedRepo = nullptr;
+    InSequence seq;
+
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([](const std::filesystem::path &)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          return makeLoadRepoError("load failed");
+      }));
+    EXPECT_CALL(*cli, initializeRepo()).WillOnce(Return(utils::error::Result<void>{}));
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([&](const std::filesystem::path &path)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          auto repo = makeRepo(path);
+          loadedRepo = repo.get();
+          return repo;
+      }));
+
+    auto result = cli->callGetRepo();
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, loadedRepo);
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getRepoReturnsInitializationErrorWhenInitializationFails)
+{
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([](const std::filesystem::path &)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          return makeLoadRepoError("load failed");
+      }));
+    EXPECT_CALL(*cli, initializeRepo()).WillOnce(Invoke([]() -> utils::error::Result<void> {
+        return makeVoidError("init failed");
+    }));
+
+    auto result = cli->callGetRepo();
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getRepoReturnsReloadErrorAfterInitialization)
+{
+    InSequence seq;
+
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([](const std::filesystem::path &)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          return makeLoadRepoError("load failed");
+      }));
+    EXPECT_CALL(*cli, initializeRepo()).WillOnce(Return(utils::error::Result<void>{}));
+    EXPECT_CALL(*cli, loadRepoFromPath(_))
+      .WillOnce(Invoke([](const std::filesystem::path &)
+                         -> utils::error::Result<std::unique_ptr<repo::OSTreeRepo>> {
+          return makeLoadRepoError("reload failed");
+      }));
+
+    auto result = cli->callGetRepo();
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(CliRepoAndPackageManagerTest, initializeRepoSucceedsWhenPackageManagerIsAvailable)
+{
+    EXPECT_CALL(*cli, getPkgMan())
+      .WillOnce(Return(utils::error::Result<api::dbus::v1::PackageManager *>{ nullptr }));
+
+    auto result = cli->callInitializeRepo();
+
+    EXPECT_TRUE(result.has_value());
+}
+
+TEST_F(CliRepoAndPackageManagerTest, initializeRepoReturnsErrorWhenPackageManagerCannotStart)
+{
+    EXPECT_CALL(*cli, getPkgMan()).WillOnce(Invoke([]() {
+        return makePackageManagerError("start package manager failed");
+    }));
+
+    auto result = cli->callInitializeRepo();
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getPkgManUsesDBusPackageManagerWhenPeerModeIsDisabled)
+{
+    auto cli = makeCli(false);
+
+    EXPECT_CALL(*cli, initializePeerModePackageManager()).Times(0);
+    EXPECT_CALL(*cli, initializeDBusPackageManager()).WillOnce(Invoke([]() {
+        return makePackageManagerInitializationError("dbus package manager failed");
+    }));
+
+    auto result = cli->callGetPkgMan();
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(CliRepoAndPackageManagerTest, getPkgManUsesPeerModePackageManagerWhenPeerModeIsEnabled)
+{
+    auto cli = makeCli(true);
+
+    EXPECT_CALL(*cli, initializeDBusPackageManager()).Times(0);
+    EXPECT_CALL(*cli, initializePeerModePackageManager()).WillOnce(Invoke([]() {
+        return makePackageManagerInitializationError("peer package manager failed");
+    }));
+
+    auto result = cli->callGetPkgMan();
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(CliTest, listUpgradableOnlyApp)
+{
+    EXPECT_CALL(*repo, listLocal())
+      .WillOnce(Return(std::vector<api::types::v1::PackageInfoV2>{ api::types::v1::PackageInfoV2{
+        .arch = std::vector<std::string>{ "x86_64" },
+        .channel = "main",
+        .id = "id1",
+        .kind = "app",
+        .packageInfoV2Module = "binary",
+        .version = "1.0.0",
+      } }));
+
+    EXPECT_CALL(*repo, latestRemoteReference(_))
+      .WillOnce(Return(package::ReferenceWithRepo{
+        .repo = api::types::v1::Repo{ .name = "repo1" },
+        .reference = package::Reference::parse("main:id1/2.0.0/x86_64").value() }));
+
+    EXPECT_CALL(*printer,
+                printUpgradeList(ElementsAre(api::types::v1::UpgradeListResult{
+                  .id = "id1",
+                  .newVersion = "2.0.0",
+                  .oldVersion = "1.0.0",
+                })))
+      .WillOnce(Return());
+    cli->list(cli::ListOptions{ .showUpgradeList = true });
+}
+
+TEST_F(CliTest, listUpgradableMultiKind)
+{
+    EXPECT_CALL(*repo, listLocal())
+      .WillOnce(Return(
+        std::vector<api::types::v1::PackageInfoV2>{ api::types::v1::PackageInfoV2{
+                                                      .arch = std::vector<std::string>{ "x86_64" },
+                                                      .channel = "main",
+                                                      .id = "id1",
+                                                      .kind = "app",
+                                                      .packageInfoV2Module = "binary",
+                                                      .version = "1.0.0",
+                                                    },
+                                                    api::types::v1::PackageInfoV2{
+                                                      .arch = std::vector<std::string>{ "x86_64" },
+                                                      .channel = "main",
+                                                      .id = "id2",
+                                                      .kind = "runtime",
+                                                      .packageInfoV2Module = "binary",
+                                                      .version = "1.0.0",
+                                                    } }));
+
+    EXPECT_CALL(*repo, latestRemoteReference(_))
+      .WillOnce(Return(package::ReferenceWithRepo{
+        .repo = api::types::v1::Repo{ .name = "repo1" },
+        .reference = package::Reference::parse("main:id1/2.0.0/x86_64").value() }));
+
+    EXPECT_CALL(*printer,
+                printUpgradeList(ElementsAre(api::types::v1::UpgradeListResult{
+                  .id = "id1",
+                  .newVersion = "2.0.0",
+                  .oldVersion = "1.0.0",
+                })))
+      .WillOnce(Return());
+    cli->list(cli::ListOptions{ .showUpgradeList = true });
+}
+
+TEST_F(CliTest, listUpgradableMultiApp)
+{
+    LINGLONG_TRACE("listUpgradableMultiApp");
+
+    EXPECT_CALL(*repo, listLocal())
+      .WillOnce(Return(
+        std::vector<api::types::v1::PackageInfoV2>{ api::types::v1::PackageInfoV2{
+                                                      .arch = std::vector<std::string>{ "x86_64" },
+                                                      .channel = "main",
+                                                      .id = "id1",
+                                                      .kind = "app",
+                                                      .packageInfoV2Module = "binary",
+                                                      .version = "1.0.0",
+                                                    },
+                                                    api::types::v1::PackageInfoV2{
+                                                      .arch = std::vector<std::string>{ "x86_64" },
+                                                      .channel = "main",
+                                                      .id = "id2",
+                                                      .kind = "app",
+                                                      .packageInfoV2Module = "binary",
+                                                      .version = "1.0.0",
+                                                    },
+                                                    api::types::v1::PackageInfoV2{
+                                                      .arch = std::vector<std::string>{ "x86_64" },
+                                                      .channel = "private",
+                                                      .id = "id2",
+                                                      .kind = "app",
+                                                      .packageInfoV2Module = "binary",
+                                                      .version = "1.0.0",
+                                                    } }));
+
+    EXPECT_CALL(*repo, latestRemoteReference(_))
+      .WillOnce(Return(package::ReferenceWithRepo{
+        .repo = api::types::v1::Repo{ .name = "repo1" },
+        .reference = package::Reference::parse("main:id1/1.0.0/x86_64").value() }))
+      .WillOnce(Return(LINGLONG_ERR("")))
+      .WillOnce(Return(package::ReferenceWithRepo{
+        .repo = api::types::v1::Repo{ .name = "repo1" },
+        .reference = package::Reference::parse("private:id2/2.0.0/x86_64").value() }));
+
+    EXPECT_CALL(*printer,
+                printUpgradeList(ElementsAre(api::types::v1::UpgradeListResult{
+                  .id = "id2",
+                  .newVersion = "2.0.0",
+                  .oldVersion = "1.0.0",
+                })))
+      .WillOnce(Return());
+    cli->list(cli::ListOptions{ .showUpgradeList = true });
+}
+
+TEST_F(CliTest, listUpgradableEmpty)
+{
+    EXPECT_CALL(*repo, listLocal()).WillOnce(Return(std::vector<api::types::v1::PackageInfoV2>{}));
+
+    EXPECT_CALL(*printer, printUpgradeList(IsEmpty())).WillOnce(Return());
+    cli->list(cli::ListOptions{ .showUpgradeList = true });
+}
+
+TEST_F(CliTest, listUpgradableNoUpgrade)
+{
+    LINGLONG_TRACE("listUpgradableMultiApp");
+
+    EXPECT_CALL(*repo, listLocal())
+      .WillOnce(Return(std::vector<api::types::v1::PackageInfoV2>{ api::types::v1::PackageInfoV2{
+        .arch = std::vector<std::string>{ "x86_64" },
+        .channel = "main",
+        .id = "id1",
+        .kind = "app",
+        .packageInfoV2Module = "binary",
+        .version = "1.0.0",
+      } }));
+
+    EXPECT_CALL(*repo, latestRemoteReference(_)).WillOnce(Return(LINGLONG_ERR("")));
+
+    EXPECT_CALL(*printer, printUpgradeList(IsEmpty())).WillOnce(Return());
+    cli->list(cli::ListOptions{ .showUpgradeList = true });
+}
+
+TEST_F(CliTest, contentPreferDesktopFromDefaultSharedDir)
+{
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
+
+    const std::string commit = "test-commit-default";
+    const auto layerEntriesDir =
+      tempDir->path() / "layers" / commit / "entries" / "share" / "applications";
+    const auto defaultDesktopPath =
+      repo->defaultSharedDir() / "applications" / "org.example.app.desktop";
+
+    std::filesystem::create_directories(layerEntriesDir);
+    std::filesystem::create_directories(defaultDesktopPath.parent_path());
+    std::ofstream(layerEntriesDir / "org.example.app.desktop") << "Test desktop content";
+    std::ofstream(defaultDesktopPath) << "Test desktop content in default";
+
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
       });
+    EXPECT_CALL(*printer,
+                printContent(ElementsAre(QString::fromStdString(defaultDesktopPath.string()))))
+      .WillOnce(Return());
 
-    auto ret = cli->run(args);
-
-    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Exec)
+TEST_F(CliTest, contentResolvesDesktopFromSymlinkedEntriesShareDir)
 {
-    auto args = parseCommand("ll-cli exec com.163.music ls");
-    EXPECT_CALL(*appMan, Exec).Times(1).WillOnce(Return(service::Reply{ 0, "" }));
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
 
-    auto ret = cli->exec(args);
+    const std::string commit = "test-commit-symlinked-share";
+    const auto layerFilesDir =
+      tempDir->path() / "layers" / commit / "files" / "share" / "applications";
+    const auto layerEntriesShareLink = tempDir->path() / "layers" / commit / "entries" / "share";
+    const auto defaultDesktopPath =
+      repo->defaultSharedDir() / "applications" / "org.example.app.desktop";
 
-    EXPECT_EQ(ret, 0);
+    std::filesystem::create_directories(layerFilesDir);
+    std::filesystem::create_directories(layerEntriesShareLink.parent_path());
+    std::filesystem::create_directories(defaultDesktopPath.parent_path());
+    std::ofstream(layerFilesDir / "org.example.app.desktop") << "Test desktop content";
+    std::ofstream(defaultDesktopPath) << "Test desktop content in default";
+
+    std::error_code ec;
+    std::filesystem::create_directory_symlink("../files/share", layerEntriesShareLink, ec);
+    if (ec) {
+        GTEST_SKIP() << "directory symlink support is required: " << ec.message();
+    }
+
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
+      });
+    EXPECT_CALL(*printer,
+                printContent(ElementsAre(QString::fromStdString(defaultDesktopPath.string()))))
+      .WillOnce(Return());
+
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Enter)
+TEST_F(CliTest, contentResolvesOverlayDesktopFromSymlinkedEntriesShareDir)
 {
-    GTEST_SKIP() << "Skip test enter as that command is not implemented yet.";
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
 
-    auto args = parseCommand("ll-cli enter xxxx");
+    const std::string commit = "test-commit-symlinked-share-overlay";
+    const auto layerFilesDir =
+      tempDir->path() / "layers" / commit / "files" / "share" / "applications";
+    const auto layerEntriesShareLink = tempDir->path() / "layers" / commit / "entries" / "share";
+    const auto overlayDesktopPath =
+      repo->overlaySharedDir() / "applications" / "org.example.app.desktop";
 
-    auto ret = cli->enter(args);
+    std::filesystem::create_directories(layerFilesDir);
+    std::filesystem::create_directories(layerEntriesShareLink.parent_path());
+    std::filesystem::create_directories(overlayDesktopPath.parent_path());
+    std::ofstream(layerFilesDir / "org.example.app.desktop") << "Test desktop content";
+    std::ofstream(overlayDesktopPath) << "Test desktop content in overlay";
 
-    EXPECT_EQ(ret, 0);
+    std::error_code ec;
+    std::filesystem::create_directory_symlink("../files/share", layerEntriesShareLink, ec);
+    if (ec) {
+        GTEST_SKIP() << "directory symlink support is required: " << ec.message();
+    }
+
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
+      });
+    EXPECT_CALL(*printer,
+                printContent(ElementsAre(QString::fromStdString(overlayDesktopPath.string()))))
+      .WillOnce(Return());
+
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Ps)
+TEST_F(CliTest, contentFallbackDesktopToOverlaySharedDir)
 {
-    auto args = parseCommand("ll-cli ps");
-    EXPECT_CALL(*appMan, ListContainer)
-      .Times(1)
-      .WillOnce(Return(service::QueryReply{ { 0, "" }, "[]" }));
-    EXPECT_CALL(*printer, printContainers);
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
 
-    auto ret = cli->ps(args);
+    const std::string commit = "test-commit-overlay";
+    const auto layerEntriesDir =
+      tempDir->path() / "layers" / commit / "entries" / "share" / "applications";
+    const auto overlayDesktopPath =
+      repo->overlaySharedDir() / "applications" / "org.example.app.desktop";
 
-    EXPECT_EQ(ret, 0);
+    std::filesystem::create_directories(layerEntriesDir);
+    std::filesystem::create_directories(overlayDesktopPath.parent_path());
+    std::ofstream(layerEntriesDir / "org.example.app.desktop") << "Test desktop content";
+    std::ofstream(overlayDesktopPath) << "Test desktop content in overlay";
+
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
+      });
+    EXPECT_CALL(*printer,
+                printContent(ElementsAre(QString::fromStdString(overlayDesktopPath.string()))))
+      .WillOnce(Return());
+
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Kill)
+TEST_F(CliTest, contentMapsLegacySystemdUserPathToExportedLibPath)
 {
-    auto args = parseCommand("ll-cli kill xxxx");
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
 
-    EXPECT_CALL(*appMan, Stop)
-      .Times(1)
-      .WillOnce(Return(service::Reply{ STATUS_CODE(kErrorPkgKillSuccess), "" }));
+    const std::string commit = "test-commit-systemd-legacy";
+    const auto layerEntriesDir =
+      tempDir->path() / "layers" / commit / "entries" / "share" / "systemd" / "user";
+    const auto exportedDir = tempDir->path() / "entries" / "lib" / "systemd" / "user";
+    const auto exportedFile = exportedDir / "org.example.app.service";
 
-    auto ret = cli->kill(args);
+    std::filesystem::create_directories(layerEntriesDir);
+    std::filesystem::create_directories(exportedDir);
+    std::ofstream(layerEntriesDir / "org.example.app.service")
+      << "[Service]\nExecStart=/bin/true\n";
+    std::ofstream(exportedFile) << "[Service]\nExecStart=/bin/true\n";
 
-    EXPECT_EQ(ret, 0);
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
+      });
+    EXPECT_CALL(*printer, printContent(ElementsAre(QString::fromStdString(exportedFile.string()))))
+      .WillOnce(Return());
+
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Install)
+TEST_F(CliTest, contentPrefersLibSystemdUserOverLegacySharePath)
 {
-    GTEST_SKIP() << "skip install test for now";
-    auto args = parseCommand("ll-cli install \'xxxx\'");
-    EXPECT_CALL(*pkgMan, Install).Times(1).WillOnce(Return(createReply(service::Reply{ 0, "" })));
+    auto ref = package::Reference::parse("main:org.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
 
-    auto ret = cli->install(args);
+    const std::string commit = "test-commit-systemd-lib";
+    const auto layerLibDir =
+      tempDir->path() / "layers" / commit / "entries" / "lib" / "systemd" / "user";
+    const auto layerLegacyDir =
+      tempDir->path() / "layers" / commit / "entries" / "share" / "systemd" / "user";
+    const auto exportedDir = tempDir->path() / "entries" / "lib" / "systemd" / "user";
+    const auto exportedFile = exportedDir / "org.example.app.service";
 
-    EXPECT_EQ(ret, 0);
+    std::filesystem::create_directories(layerLibDir);
+    std::filesystem::create_directories(layerLegacyDir);
+    std::filesystem::create_directories(exportedDir);
+    std::ofstream(layerLibDir / "org.example.app.service") << "[Service]\nExecStart=/bin/true\n";
+    std::ofstream(layerLegacyDir / "org.example.app.service") << "[Service]\nExecStart=/bin/true\n";
+    std::ofstream(exportedFile) << "[Service]\nExecStart=/bin/true\n";
+
+    api::types::v1::RepositoryCacheLayersItem layerItem;
+    layerItem.commit = commit;
+    layerItem.info.kind = "app";
+
+    EXPECT_CALL(*repo, clearReferenceLocal(_, _)).WillOnce(Return(*ref));
+    EXPECT_CALL(*repo, getLayerItem(_, _))
+      .WillRepeatedly([layerItem](const package::Reference &, std::string)
+                        -> utils::error::Result<api::types::v1::RepositoryCacheLayersItem> {
+          return layerItem;
+      });
+    EXPECT_CALL(*printer, printContent(ElementsAre(QString::fromStdString(exportedFile.string()))))
+      .WillOnce(Return());
+
+    EXPECT_EQ(cli->content(cli::ContentOptions{ .appid = "org.example.app" }), 0);
 }
 
-TEST_F(CLITest, Upgrade)
-{
-    GTEST_SKIP() << "skip upgrade test for now";
-    auto args = parseCommand("ll-cli upgrade \'xxxx\'");
-    EXPECT_CALL(*pkgMan, Update)
-      .Times(1)
-      .WillOnce(Return(createReply(service::Reply{ STATUS_CODE(kErrorPkgUpdateSuccess), "" })));
-
-    auto ret = cli->upgrade(args);
-
-    EXPECT_EQ(ret, 0);
-}
-
-TEST_F(CLITest, Search)
-{
-    auto args = parseCommand("ll-cli search xxxx");
-    EXPECT_CALL(*pkgMan, Query)
-      .Times(1)
-      .WillOnce(Return(
-        createReply(service::QueryReply{ { STATUS_CODE(kErrorPkgQuerySuccess), "" }, R"([])" })));
-    EXPECT_CALL(*printer, printErr).Times(1);
-
-    auto ret = cli->search(args);
-
-    EXPECT_EQ(ret, -1);
-}
-
-TEST_F(CLITest, Uninstall)
-{
-    auto args = parseCommand("ll-cli uninstall \'xxx aaa\'");
-    EXPECT_CALL(*pkgMan, Uninstall)
-      .Times(1)
-      .WillOnce(Return(createReply(service::Reply{ STATUS_CODE(kPkgUninstallSuccess), "" })));
-
-    auto ret = cli->uninstall(args);
-
-    EXPECT_EQ(ret, 0);
-}
-
-TEST_F(CLITest, List)
-{
-    auto args = parseCommand("ll-cli list");
-    EXPECT_CALL(*pkgMan, Query)
-      .Times(1)
-      .WillOnce(Return(
-        createReply(service::QueryReply{ { STATUS_CODE(kErrorPkgQuerySuccess), "" }, "[]" })));
-    EXPECT_CALL(*printer, printAppMetaInfos).Times(1);
-
-    auto ret = cli->list(args);
-
-    EXPECT_EQ(ret, 0);
-}
-
-TEST_F(CLITest, repo)
-{
-    auto args = parseCommand("ll-cli repo list");
-    EXPECT_CALL(*pkgMan, getRepoInfo)
-      .Times(1)
-      .WillOnce(
-        Return(createReply(service::QueryReply{ { STATUS_CODE(kErrorPkgQuerySuccess), "" }, "" })));
-
-    auto ret = cli->repo(args);
-
-    EXPECT_EQ(ret, 0);
-}
-
-} // namespace linglong::cli::test
+} // namespace

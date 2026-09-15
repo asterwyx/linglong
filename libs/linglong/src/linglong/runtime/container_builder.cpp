@@ -1,451 +1,795 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #include "linglong/runtime/container_builder.h"
 
-#include "linglong/api/types/v1/ApplicationConfiguration.hpp"
-#include "linglong/utils/configure.h"
-#include "linglong/utils/error/error.h"
-#include "linglong/utils/serialize/json.h"
-#include "linglong/utils/serialize/yaml.h"
-#include "ocppi/runtime/config/types/Generators.hpp"
-#include "ocppi/runtime/config/types/Mount.hpp"
+#include "linglong/cli/cli.h"
+#include "linglong/common/dir.h"
+#include "linglong/common/strings.h"
+#include "linglong/common/xdg.h"
+#include "linglong/oci-cfg-generators/container_cfg_builder.h"
+#include "linglong/package/architecture.h"
+#include "linglong/runtime/run_context.h"
+#include "linglong/utils/log/log.h"
 
-#include <qglobal.h>
-#include <qstandardpaths.h>
-#include <qtemporarydir.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
+#include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusReply>
+
+#include <algorithm>
 #include <fstream>
-#include <unordered_set>
+
+#include <unistd.h>
 
 namespace linglong::runtime {
 
 namespace {
-auto getPatchesForApplication(const QString &appID) noexcept
-  -> std::vector<api::types::v1::OciConfigurationPatch>
+
+const std::vector<std::string> buildContainerCaps = {
+    "CAP_CHOWN",   "CAP_DAC_OVERRIDE",     "CAP_FOWNER",     "CAP_FSETID",
+    "CAP_KILL",    "CAP_NET_BIND_SERVICE", "CAP_SETFCAP",    "CAP_SETGID",
+    "CAP_SETPCAP", "CAP_SETUID",           "CAP_SYS_CHROOT",
+};
+
+auto isPathInRootfs(const std::filesystem::path &path, const std::filesystem::path &rootfs) noexcept
+  -> bool
 {
-    auto filePath =
-      QStandardPaths::locate(QStandardPaths::ConfigLocation, "linglong/" + appID + "/config.yaml");
-    if (filePath.isEmpty()) {
-        return {};
+    auto relative = path.lexically_normal().lexically_relative(rootfs.lexically_normal());
+    if (relative.empty()) {
+        return false;
     }
 
-    LINGLONG_TRACE(QString("get OCI patches for application %1").arg(appID));
-
-    auto config =
-      utils::serialize::LoadYAMLFile<api::types::v1::ApplicationConfiguration>(filePath);
-    if (!config) {
-        qWarning() << LINGLONG_ERRV(config);
-        Q_ASSERT(false);
-        return {};
-    }
-
-    if (!config->permissions) {
-        return {};
-    }
-
-    if (!config->permissions->binds) {
-        return {};
-    }
-
-    std::vector<api::types::v1::OciConfigurationPatch> patches;
-
-    for (const auto &bind : *config->permissions->binds) {
-        patches.push_back({ .ociVersion = "1.0.1",
-                            .patch = nlohmann::json::array({
-                              { "op", "add" },
-                              { "path", "/mounts/-" },
-                              { "value",
-                                { { "source", bind.source },
-                                  { "destination", bind.destination },
-                                  { "options",
-                                    nlohmann::json::array({
-                                      "rbind",
-                                      "nosuid",
-                                      "nodev",
-                                    }) } } },
-                            }) });
-    }
-
-    return patches;
+    auto it = relative.begin();
+    return it == relative.end() || *it != "..";
 }
 
-void applyJSONPatch(ocppi::runtime::config::types::Config &cfg,
-                    const api::types::v1::OciConfigurationPatch &patch) noexcept
+auto getXDPDocumentsMountPoint() noexcept -> utils::error::Result<std::filesystem::path>
 {
-    LINGLONG_TRACE(QString("apply oci runtime config patch %1")
-                     .arg(QString::fromStdString(nlohmann::json(patch).dump(-1, ' ', true))));
+    LINGLONG_TRACE("get XDP Documents mount point");
 
-    if (patch.ociVersion != cfg.ociVersion) {
-        qWarning() << LINGLONG_ERRV("ociVersion mismatched");
-        Q_ASSERT(false);
-        return;
+    auto bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        return LINGLONG_ERR("session bus is not connected");
     }
 
-    auto raw = nlohmann::json(cfg);
-    try {
-        raw = raw.patch(patch.patch);
-        cfg = raw.get<ocppi::runtime::config::types::Config>();
-    } catch (...) {
-        qCritical() << LINGLONG_ERRV("apply patch", std::current_exception());
-        Q_ASSERT(false);
-        return;
+    QDBusInterface documentsPortal("org.freedesktop.portal.Documents",
+                                   "/org/freedesktop/portal/documents",
+                                   "org.freedesktop.portal.Documents",
+                                   bus);
+    if (!documentsPortal.isValid()) {
+        return LINGLONG_ERR("org.freedesktop.portal.Documents is not available");
     }
+
+    auto reply = documentsPortal.call(QDBus::Block, "GetMountPoint");
+    if (reply.type() == QDBusMessage::ErrorMessage) {
+        return LINGLONG_ERR(reply.errorMessage().toStdString());
+    }
+
+    if (reply.arguments().isEmpty()) {
+        return LINGLONG_ERR("Documents portal mount point reply is empty");
+    }
+
+    auto arguments = reply.arguments();
+    const auto &value = arguments.constFirst();
+    if (!value.canConvert<QByteArray>()) {
+        return LINGLONG_ERR(
+          fmt::format("unexpected Documents portal mount point type: {}", value.typeName()));
+    }
+    auto mountPoint = value.toByteArray().toStdString();
+
+    if (mountPoint.empty()) {
+        return LINGLONG_ERR("Documents portal mount point is empty");
+    }
+
+    // c_str is crucial here, without it the path may include trailing null bytes
+    return std::filesystem::path{ mountPoint.c_str() };
 }
 
-void applyJSONFilePatch(ocppi::runtime::config::types::Config &cfg, const QFileInfo &info) noexcept
+} // namespace
+
+utils::error::Result<std::filesystem::path> makeBundleDir(const std::string &containerID,
+                                                          const std::string &bundleSuffix)
 {
-    if (!info.isFile()) {
-        return;
+    LINGLONG_TRACE("get bundle dir");
+    auto bundle = common::dir::getBundleDir(containerID);
+    if (!bundleSuffix.empty()) {
+        bundle += bundleSuffix;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(bundle, ec)) {
+        std::filesystem::remove_all(bundle, ec);
+        if (ec) {
+            LogW("failed to remove bundle directory {}: {}", bundle.c_str(), ec.message());
+        }
     }
 
-    LINGLONG_TRACE(QString("apply oci runtime config patch file %1").arg(info.absoluteFilePath()));
-
-    if (!info.absoluteFilePath().endsWith(".json")) {
-        qWarning() << LINGLONG_ERRV("file not ends with .json");
-        Q_ASSERT(false);
-        return;
+    if (!std::filesystem::create_directories(bundle, ec) && ec) {
+        return LINGLONG_ERR(fmt::format("failed to create bundle directory {}", bundle), ec);
     }
 
-    auto patch = utils::serialize::LoadJSONFile<api::types::v1::OciConfigurationPatch>(
-      info.absoluteFilePath());
-    if (!patch) {
-        qWarning() << LINGLONG_ERRV(patch);
-        Q_ASSERT(false);
-        return;
-    }
-
-    applyJSONPatch(cfg, *patch);
+    return bundle;
 }
 
-void applyExecutablePatch(ocppi::runtime::config::types::Config &cfg,
-                          const QFileInfo &info) noexcept
+std::string genContainerID(const api::types::v1::RunContextConfig &config) noexcept
 {
-    LINGLONG_TRACE(QString("process oci configuration generator %1").arg(info.absoluteFilePath()));
-
-    QProcess generatorProcess;
-    generatorProcess.setProgram(info.absoluteFilePath());
-    generatorProcess.start();
-    generatorProcess.write(QByteArray::fromStdString(nlohmann::json(cfg).dump()));
-    generatorProcess.closeWriteChannel();
-
-    constexpr auto timeout = 200;
-    if (!generatorProcess.waitForFinished(timeout)) {
-        qCritical() << LINGLONG_ERRV(generatorProcess.errorString(), generatorProcess.error());
-        Q_ASSERT(false);
-        return;
-    }
-
-    auto error = generatorProcess.readAllStandardError();
-    if (generatorProcess.exitCode() != 0) {
-        qCritical() << "generator" << info.absoluteFilePath() << "return"
-                    << generatorProcess.exitCode() << Qt::endl
-                    << "input:" << nlohmann::json(cfg).dump().c_str() << Qt::endl
-                    << "stderr:" << error;
-        Q_ASSERT(false);
-        return;
-    }
-    if (not error.isEmpty()) {
-        qDebug() << "generator" << info.absoluteFilePath() << "stderr:" << error;
-    }
-
-    auto result = generatorProcess.readAllStandardOutput();
-    auto modified = utils::serialize::LoadJSON<ocppi::runtime::config::types::Config>(result);
-    if (!modified) {
-        qCritical() << LINGLONG_ERRV("parse stdout", modified);
-        Q_ASSERT(false);
-        return;
-    }
-
-    cfg = *modified;
+    auto jsonStr = nlohmann::json(config).dump();
+    return QCryptographicHash::hash(QByteArray::fromStdString(jsonStr), QCryptographicHash::Sha256)
+      .toHex()
+      .toStdString();
 }
 
-void applyPatches(ocppi::runtime::config::types::Config &cfg, const QFileInfoList &patches) noexcept
+auto RunContainerOptions::applyRuntimeConfig(
+  const api::types::v1::RuntimeConfigure &runtimeConfig) noexcept -> utils::error::Result<void>
 {
-
-    for (const auto &info : patches) {
-        if (!info.isFile()) {
-            continue;
-        }
-
-        if (info.isExecutable()) {
-            applyExecutablePatch(cfg, info);
-            continue;
-        }
-
-        applyJSONFilePatch(cfg, info);
-    }
-}
-
-void applyPatches(ocppi::runtime::config::types::Config &cfg,
-                  const std::vector<api::types::v1::OciConfigurationPatch> &patches) noexcept
-{
-    for (const auto &patch : patches) {
-        applyJSONPatch(cfg, patch);
-    }
-}
-
-auto getOCIConfig(const ContainerOptions &opts) noexcept
-  -> utils::error::Result<ocppi::runtime::config::types::Config>
-{
-    LINGLONG_TRACE("get origin OCI configuration file");
-
-    QTemporaryDir dir;
-    dir.setAutoRemove(false);
-    QString containerConfigFilePath = qgetenv("LINGLONG_CONTAINER_CONFIG");
-    if (containerConfigFilePath.isEmpty()) {
-        containerConfigFilePath = LINGLONG_INSTALL_PREFIX "/lib/linglong/container/config.json";
-        if (!QFile(containerConfigFilePath).exists()) {
-            return LINGLONG_ERR(
-              QString("The container configuration file doesn't exist: %1\n"
-                      "You can specify a custom location using the LINGLONG_CONTAINER_CONFIG")
-                .arg(containerConfigFilePath));
-        }
+    if (runtimeConfig.disableXdp.has_value()) {
+        this->disableXdp = *runtimeConfig.disableXdp;
     }
 
-    auto config = utils::serialize::LoadJSONFile<ocppi::runtime::config::types::Config>(
-      containerConfigFilePath);
-    if (!config) {
-        Q_ASSERT(false);
-        return LINGLONG_ERR(config);
+    if (runtimeConfig.enablePipewire.has_value()) {
+        this->enablePipewireSocketMount = *runtimeConfig.enablePipewire;
     }
 
-    config->root = ocppi::runtime::config::types::Root{
-        .path = opts.baseDir.absoluteFilePath("files").toStdString(),
-        .readonly = true,
-    };
-
-    auto annotations = config->annotations.value_or(std::map<std::string, std::string>{});
-    annotations["org.deepin.linglong.appID"] = opts.appID.toStdString();
-    annotations["org.deepin.linglong.baseDir"] = opts.baseDir.absolutePath().toStdString();
-
-    if (opts.runtimeDir) {
-        annotations["org.deepin.linglong.runtimeDir"] =
-          opts.runtimeDir->absolutePath().toStdString();
-    }
-    if (opts.appDir) {
-        annotations["org.deepin.linglong.appDir"] = opts.appDir->absolutePath().toStdString();
-    }
-    config->annotations = std::move(annotations);
-
-    QDir configDotDDir = QFileInfo(containerConfigFilePath).dir().filePath("config.d");
-    Q_ASSERT(configDotDDir.exists());
-
-    applyPatches(*config, configDotDDir.entryInfoList(QDir::Files));
-
-    auto appPatches = getPatchesForApplication(opts.appID);
-
-    applyPatches(*config, appPatches);
-
-    applyPatches(*config, opts.patches);
-
-    Q_ASSERT(config->mounts.has_value());
-    auto &mounts = *config->mounts;
-
-    mounts.insert(mounts.end(), opts.mounts.begin(), opts.mounts.end());
-
-    config->linux_->maskedPaths = opts.masks;
-
-    return config;
-}
-
-auto fixMount(ocppi::runtime::config::types::Config config) noexcept
-  -> utils::error::Result<ocppi::runtime::config::types::Config>
-{
-
-    LINGLONG_TRACE("fix mount points.")
-
-    if (!config.mounts || !config.root) {
-        return config;
+    if (runtimeConfig.enableAtspi.has_value()) {
+        this->enableAtSpiSocketMount = *runtimeConfig.enableAtspi;
     }
 
-    auto originalRoot = QDir{ QString::fromStdString(config.root.value().path) };
-    config.root = { { .path = "rootfs", .readonly = false } };
-
-    auto &mounts = config.mounts.value();
-    auto commonParent = [](const QString &path1, const QString &path2) {
-        QString ret = path2;
-        while (!path1.startsWith(ret)) {
-            ret.chop(1);
-        }
-        if (ret.isEmpty()) {
-            return ret;
-        }
-        while (!ret.endsWith('/')) {
-            ret.chop(1);
-        }
-        return QDir::cleanPath(ret);
-    };
-
-    QStringList tmpfsPath;
-    for (const auto &mount : mounts) {
-        if (mount.destination.empty() || mount.destination.at(0) != '/') {
-            continue;
-        }
-
-        auto hostSource = QDir::cleanPath(
-          originalRoot.filePath(QString::fromStdString(mount.destination.substr(1))));
-        if (QFileInfo::exists(hostSource)) {
-            continue;
-        }
-
-        auto elem = hostSource.split(QDir::separator());
-        while (!elem.isEmpty() && !QFile::exists(elem.join(QDir::separator()))) {
-            elem.removeLast();
-        }
-
-        if (elem.isEmpty()) {
-            qWarning() << "invalid host source:" << hostSource;
-            continue;
-        }
-
-        bool newTmp{ true };
-        auto existsPath = elem.join(QDir::separator());
-        auto originalRootPath = QDir::cleanPath(originalRoot.absolutePath());
-        if (existsPath <= originalRootPath) {
-            continue;
-        }
-
-        for (auto it = tmpfsPath.cbegin(); it != tmpfsPath.cend(); ++it) {
-            if (existsPath == *it) {
-                newTmp = false;
-                continue;
-            }
-
-            if (auto common = commonParent(existsPath, *it); common > originalRootPath) {
-                newTmp = false;
-                tmpfsPath.replace(it - tmpfsPath.cbegin(), common);
+    if (runtimeConfig.deviceMode) {
+        for (const auto &option : *runtimeConfig.deviceMode) {
+            if (option == api::types::v1::DeviceOption::Passthru) {
+                this->devicePassthru = true;
                 break;
             }
         }
+    }
 
-        if (newTmp) {
-            tmpfsPath.push_back(existsPath);
+    if (runtimeConfig.env) {
+        for (const auto &[key, value] : *runtimeConfig.env) {
+            this->env.insert_or_assign(key, value);
         }
     }
 
-    using MountType = std::remove_reference_t<decltype(mounts)>::value_type;
-    auto rootBinds = originalRoot.entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot);
-    auto pos = mounts.begin();
-    for (const auto &bind : rootBinds) {
-        auto destination = "/" + bind.fileName();
-        auto mountPoint = MountType{ .destination = destination.toStdString(),
-                                     .options = { { "rbind", "ro" } },
-                                     .source = bind.absoluteFilePath().toStdString(),
-                                     .type = "bind" };
-        if (bind.isSymLink()) {
-            mountPoint.options->emplace_back("copy-symlink");
-        }
-        pos = mounts.insert(pos, std::move(mountPoint));
-        ++pos;
-    }
+    return LINGLONG_OK;
+}
 
-    for (const auto &tmpfs : tmpfsPath) {
-        pos = mounts.insert(
-          pos,
-          MountType{ .destination = tmpfs.mid(originalRoot.absolutePath().size()).toStdString(),
-                     .options = { { "nodev", "nosuid", "mode=755" } },
-                     .source = "tmpfs",
-                     .type = "tmpfs" });
-        ++pos;
+auto RunContainerOptions::applyCliRunOptions(const cli::RunOptions &options) noexcept
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("apply cli run options to run config");
 
-        auto dir = QDir{ tmpfs };
-        for (const auto &rootDest :
-             dir.entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot)) {
-            auto rootDestPath = rootDest.absoluteFilePath();
-            auto destination = rootDestPath.mid(originalRoot.absolutePath().size());
-            auto mountPoint = MountType{ .destination = destination.toStdString(),
-                                         .options = { { "rbind", "ro" } },
-                                         .source = rootDestPath.toStdString(),
-                                         .type = "bind" };
-            if (rootDest.isSymLink()) {
-                mountPoint.options->emplace_back("copy-symlink");
-            }
-            pos = mounts.insert(pos, std::move(mountPoint));
-            ++pos;
+    for (const auto &option : options.deviceOptions) {
+        if (option == api::types::v1::DeviceOption::Passthru) {
+            this->devicePassthru = true;
+            break;
         }
     }
 
-    // remove extra mount points
-    std::unordered_set<std::string> dups;
-    for (auto it = mounts.crbegin(); it != mounts.crend(); ++it) {
-        if (dups.find(it->destination) != dups.end()) {
-            mounts.erase(std::next(it).base());
-            continue;
+    for (const auto &item : options.envs) {
+        auto split = item.find('=');
+        if (split == std::string::npos || split == 0) {
+            return LINGLONG_ERR(fmt::format("invalid environment variable: {}", item));
         }
 
-        dups.insert(it->destination);
+        this->env.insert_or_assign(item.substr(0, split), item.substr(split + 1));
     }
 
-    return config;
-};
+    if (options.disableXdp.has_value()) {
+        this->disableXdp = *options.disableXdp;
+    }
 
-} // namespace
+    if (options.enablePipewireSocketMount.has_value()) {
+        this->enablePipewireSocketMount = *options.enablePipewireSocketMount;
+    }
+
+    if (options.enableAtSpiSocketMount.has_value()) {
+        this->enableAtSpiSocketMount = *options.enableAtSpiSocketMount;
+    }
+    this->privileged = options.privileged;
+    this->capabilities.insert(this->capabilities.end(),
+                              options.capsAdd.begin(),
+                              options.capsAdd.end());
+
+    return LINGLONG_OK;
+}
+
+auto RunContainerOptions::getEnv() const noexcept -> const std::map<std::string, std::string> &
+{
+    return this->env;
+}
+
+auto RunContainerOptions::getCapabilities() const noexcept -> const std::vector<std::string> &
+{
+    return this->capabilities;
+}
+
+void RunContainerOptions::enableSecurityContext(const std::vector<SecurityContextType> &ctxs)
+{
+    for (const auto &type : ctxs) {
+        if (std::find(this->securityContexts.begin(), this->securityContexts.end(), type)
+            == this->securityContexts.end()) {
+            this->securityContexts.emplace_back(type);
+        }
+    }
+}
+
+auto RunContainerOptions::getSecurityContexts() const noexcept
+  -> const std::vector<SecurityContextType> &
+{
+    return this->securityContexts;
+}
+
+auto RunContainerOptions::isDevicePassthruEnabled() const noexcept -> bool
+{
+    return this->devicePassthru;
+}
+
+auto RunContainerOptions::isPipewireSocketMountEnabled() const noexcept -> bool
+{
+    return this->enablePipewireSocketMount;
+}
+
+auto RunContainerOptions::isAtSpiSocketMountEnabled() const noexcept -> bool
+{
+    return this->enableAtSpiSocketMount;
+}
+
+auto RunContainerOptions::isXdpDisabled() const noexcept -> bool
+{
+    return this->disableXdp;
+}
+
+auto RunContainerOptions::isPrivileged() const noexcept -> bool
+{
+    return this->privileged;
+}
 
 ContainerBuilder::ContainerBuilder(ocppi::cli::CLI &cli)
     : cli(cli)
 {
 }
 
-auto ContainerBuilder::create(const ContainerOptions &opts) noexcept
-  -> utils::error::Result<QSharedPointer<Container>>
+auto ContainerBuilder::bundleSuffixFor(ContainerMode mode) -> std::string
+{
+    switch (mode) {
+    case ContainerMode::Init:
+        return ".init";
+    case ContainerMode::Build:
+        return ".build";
+    case ContainerMode::Run:
+        return "";
+    }
+
+    return "";
+}
+
+auto ContainerBuilder::overlayReadOnlyFor(ContainerMode mode) -> bool
+{
+    switch (mode) {
+    case ContainerMode::Init:
+        return false;
+    case ContainerMode::Build:
+        return false;
+    case ContainerMode::Run:
+        return true;
+    }
+
+    return true;
+}
+
+auto ContainerBuilder::appCacheReadOnlyFor(ContainerMode mode) -> bool
+{
+    switch (mode) {
+    case ContainerMode::Init:
+        return false;
+    case ContainerMode::Build:
+        return false;
+    case ContainerMode::Run:
+        return true;
+    }
+
+    return true;
+}
+
+auto ContainerBuilder::createBuildContainer(runtime::RunContext &context,
+                                            const BuilderContainerOptions &options) noexcept
+  -> utils::error::Result<std::unique_ptr<Container>>
+{
+    LINGLONG_TRACE("create build container");
+
+    auto prepared = this->prepareContainer(context, ContainerMode::Build, options.common);
+    if (!prepared) {
+        return LINGLONG_ERR(prepared);
+    }
+
+    auto res = this->configureBuildContainer(*prepared, options);
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    return this->finalizeContainer(*prepared);
+}
+
+auto ContainerBuilder::create(const linglong::generator::ContainerCfgBuilder &cfgBuilder,
+                              std::unique_ptr<ContainerContext> context) noexcept
+  -> utils::error::Result<std::unique_ptr<Container>>
 {
     LINGLONG_TRACE("create container");
 
-    auto originalConfig = getOCIConfig(opts);
-    if (!originalConfig) {
-        return LINGLONG_ERR(originalConfig);
+    auto config = cfgBuilder.getConfig();
+    if (!context) {
+        return LINGLONG_ERR("container context is null");
     }
 
-    QDir runtimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
-    QDir bundle = runtimeDir.absoluteFilePath(QString("linglong/%1").arg(opts.containerID));
-    Q_ASSERT(!bundle.exists());
-    if (!bundle.mkpath(".")) {
-        return LINGLONG_ERR(QString("make bundle directory failed %1").arg(bundle.absolutePath()));
+    return std::make_unique<Container>(config, std::move(context), this->cli);
+}
+
+auto ContainerBuilder::prepareContainer(runtime::RunContext &context,
+                                        ContainerMode mode,
+                                        const CommonContainerOptions &options) noexcept
+  -> utils::error::Result<PreparedContainer>
+{
+    LINGLONG_TRACE("prepare container");
+
+    auto containerContext = ContainerContext::create(context,
+                                                     ContainerContext::CreateOptions{
+                                                       .bundleSuffix = bundleSuffixFor(mode),
+                                                       .appCache = options.containerCachePath,
+                                                     });
+    if (!containerContext) {
+        return LINGLONG_ERR("failed to create container context of " + context.getContainerId(),
+                            containerContext);
     }
 
-    // save env to /run/user/1000/linglong/xxx/00env.sh, mount it to /etc/profile.d/00env.sh
-    std::string envShFile = bundle.absoluteFilePath("00env.sh").toStdString();
-    {
-        std::ofstream ofs(envShFile);
-        Q_ASSERT(ofs.is_open());
-        if (!ofs.is_open()) {
-            return LINGLONG_ERR("create 00env.sh failed in bundle directory");
+    PreparedContainer prepared{
+        .runContext = &context,
+        .context = std::move(*containerContext),
+        .mode = mode,
+    };
+
+    auto res = context.fillContextCfg(prepared.cfgBuilder, prepared.context->getBundleDir());
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    if (!options.extraMounts.empty()) {
+        prepared.cfgBuilder.addExtraMounts(options.extraMounts);
+    }
+
+    auto uid = getuid();
+    auto gid = getgid();
+
+    prepared.cfgBuilder.setAppId(prepared.runContext->getTargetID())
+      .setBundlePath(prepared.context->getBundleDir())
+      .addUIdMapping(uid, uid, 1)
+      .addGIdMapping(gid, gid, 1)
+      .bindDefault()
+      .bindCgroup();
+
+    if (const auto &appCache = prepared.context->getContainerCache(); appCache) {
+        prepared.cfgBuilder.setAppCache(*appCache, appCacheReadOnlyFor(mode));
+    }
+
+    return prepared;
+}
+
+auto ContainerBuilder::finalizeContainer(PreparedContainer &prepared) noexcept
+  -> utils::error::Result<std::unique_ptr<Container>>
+{
+    LINGLONG_TRACE("finalize container");
+
+    auto buildErr = prepared.cfgBuilder.build();
+    if (!buildErr) {
+        return LINGLONG_ERR("build cfg error", buildErr);
+    }
+
+    // must be set after cfgBuilder.build()
+    std::string triplet;
+    bool useOverlayMode = true;
+    bool needGenLdConf = false;
+    if (prepared.mode == ContainerMode::Init) {
+        auto targetLayer = prepared.runContext->getTargetLayer();
+        if (!targetLayer) {
+            return LINGLONG_ERR("target layer not found", targetLayer);
         }
 
-        for (const auto &env : originalConfig->process->env.value()) {
-            const QString envStr = QString::fromStdString(env);
-            auto pos = envStr.indexOf("=");
-            auto value = envStr.mid(pos + 1, envStr.length());
-            // here we process environment variables with single quotes.
-            // A=a'b ===> A='a'\''b'
-            value.replace("'", R"('\'')");
+        triplet = targetLayer->get().getReference().arch.getTriplet();
+        needGenLdConf = true;
+    } else if (prepared.mode == ContainerMode::Build) {
+        triplet = package::Architecture::currentCPUArchitecture().getTriplet();
+        useOverlayMode = false;
+        needGenLdConf = true;
+    }
 
-            // We need to quote the values environment variables
-            // avoid loading errors when some environment variables have multiple values, such as
-            // (a;b).
-            const auto fixEnv = QString(R"(%1='%2')").arg(envStr.mid(0, pos)).arg(value);
-            ofs << "export " << fixEnv.toStdString() << std::endl;
+    if (needGenLdConf) {
+        auto genRes =
+          prepared.context->genLdConf(prepared.cfgBuilder.ldConf(triplet), useOverlayMode);
+        if (!genRes) {
+            return LINGLONG_ERR("generate ld config", genRes);
         }
-        ofs.close();
     }
 
-    originalConfig->mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/profile.d/00env.sh",
-      .options = { { "ro", "rbind" } },
-      .source = envShFile,
-      .type = "bind",
-    });
+    return this->create(prepared.cfgBuilder, std::move(prepared.context));
+}
 
-    auto config = fixMount(*originalConfig);
-    if (!config) {
-        return LINGLONG_ERR(config);
+auto ContainerBuilder::configureBuildContainer(PreparedContainer &prepared,
+                                               const BuilderContainerOptions &options) noexcept
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("configure build container");
+
+    prepared.cfgBuilder.setBasePath(options.basePath, false)
+      .forwardDefaultEnv()
+      .appendEnv("LINYAPS_INIT_SKIP_LOCK", "YES")
+      .disableUserNamespace()
+      .setCapabilities(buildContainerCaps)
+      .enableLDConf();
+
+    if (options.runtimePath) {
+        prepared.cfgBuilder.setRuntimePath(*options.runtimePath, false);
     }
 
-    return QSharedPointer<Container>::create(*config, opts.appID, opts.containerID, this->cli);
+    if (!options.startContainerHooks.empty()) {
+        prepared.cfgBuilder.setStartContainerHooks(options.startContainerHooks);
+    }
+
+    if (!options.masks.empty()) {
+        prepared.cfgBuilder.addMask(options.masks);
+    }
+
+    if (options.isolateNetWork) {
+        prepared.cfgBuilder.isolateNetWork();
+    }
+
+    auto res = normalizeContainerRootfs(options.basePath, prepared.runContext->getConfig());
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    return LINGLONG_OK;
+}
+
+auto ContainerBuilder::normalizeContainerRootfs(
+  const std::filesystem::path &rootfs, const api::types::v1::RunContextConfig &config) noexcept
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("normalize container rootfs");
+
+    // these files may be created as symlink, remove them from rootfs to avoid create failure
+    std::vector<std::filesystem::path> remove{
+        "/etc/localtime",
+        "/etc/resolv.conf",
+    };
+
+    for (const auto &r : remove) {
+        std::error_code ec;
+        auto target = rootfs / (r.is_absolute() ? r.relative_path() : r);
+        if (std::filesystem::exists(target, ec)) {
+            std::filesystem::remove(target, ec);
+            if (ec) {
+                LogW("failed to remove {}: {}", target, ec.message());
+            }
+        }
+    }
+
+    // create symlink for timezone
+    if (config.timezone && !config.timezone->empty()) {
+        auto localtimePath = rootfs / "etc/localtime";
+        auto timezonePath = generator::ContainerCfgBuilder::zoneinfoMountPoint / *config.timezone;
+        std::error_code ec;
+        std::filesystem::create_symlink(timezonePath, localtimePath, ec);
+        if (ec) {
+            return LINGLONG_ERR(
+              fmt::format("failed to create symlink {} -> {}", localtimePath, timezonePath),
+              ec);
+        }
+    }
+
+    auto ensureMountPoint = [&](const std::string &destination,
+                                const std::string &srcType) -> utils::error::Result<void> {
+        auto destPath = std::filesystem::path(destination);
+        auto dest = rootfs / (destPath.is_absolute() ? destPath.relative_path() : destPath);
+        if (!isPathInRootfs(dest, rootfs)) {
+            return LINGLONG_ERR(
+              fmt::format("mount destination {} is outside rootfs {}", dest, rootfs));
+        }
+
+        std::error_code ec;
+        if (std::filesystem::exists(dest, ec)) {
+            const auto destIsDirectory = std::filesystem::is_directory(dest, ec);
+            if (!ec
+                && ((srcType == "file" && !destIsDirectory)
+                    || (srcType != "file" && destIsDirectory))) {
+                return LINGLONG_OK;
+            }
+
+            ec.clear();
+            std::filesystem::remove_all(dest, ec);
+            if (ec) {
+                LogW("failed to recreate mount point {}: {}", dest, ec.message());
+                return LINGLONG_OK;
+            }
+        }
+        if (srcType == "file") {
+            std::filesystem::create_directories(dest.parent_path(), ec);
+            if (ec) {
+                LogW("failed to create directories for mount point {}: {}",
+                     dest.parent_path(),
+                     ec.message());
+                return LINGLONG_OK;
+            }
+            std::ofstream(dest) << "";
+        } else {
+            std::filesystem::create_directories(dest, ec);
+            if (ec) {
+                LogW("failed to create mount point {}: {}", dest, ec.message());
+            }
+        }
+        return LINGLONG_OK;
+    };
+
+    if (config.mounts) {
+        for (const auto &m : *config.mounts) {
+            if (!m.srcType) {
+                continue;
+            }
+            auto ret = ensureMountPoint(m.destination, *m.srcType);
+            if (!ret) {
+                return ret;
+            }
+        }
+    }
+
+    if (config.hostDynamic) {
+        for (const auto &state : *config.hostDynamic) {
+            if (!state.srcType) {
+                continue;
+            }
+            auto ret = ensureMountPoint(state.destination, *state.srcType);
+            if (!ret) {
+                return ret;
+            }
+        }
+    }
+
+    return LINGLONG_OK;
+}
+
+auto ContainerBuilder::configureInitContainer(PreparedContainer &prepared) noexcept
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("configure init container");
+
+    auto &runContext = *prepared.runContext;
+
+    prepared.cfgBuilder.bindUserGroup()
+      .bindXDGRuntime()
+      .bindHostRoot()
+      .bindHostStatics()
+      .forwardDefaultEnv()
+      .appendEnv("LINYAPS_INIT_SKIP_LOCK", "YES");
+
+    if (runContext.getConfig().overlayfs) {
+        auto res = prepared.context->setupOverlayFS(runContext, true);
+        if (!res) {
+            return LINGLONG_ERR("setup overlayfs", res);
+        }
+
+        res = normalizeContainerRootfs(prepared.context->getBundleDir() / "rootfs",
+                                       runContext.getConfig());
+        if (!res) {
+            return LINGLONG_ERR(res);
+        }
+
+        prepared.cfgBuilder.enableOverlayMode(prepared.context->getBundleDir() / "rootfs", false);
+    }
+
+    auto applyRes = runContext.setupCDIDevices(prepared.cfgBuilder);
+    if (!applyRes) {
+        return LINGLONG_ERR(applyRes);
+    }
+
+    return LINGLONG_OK;
+}
+
+auto ContainerBuilder::createInitContainer(runtime::RunContext &context,
+                                           const CommonContainerOptions &options) noexcept
+  -> utils::error::Result<std::unique_ptr<Container>>
+{
+    LINGLONG_TRACE("create init container");
+
+    auto prepared = this->prepareContainer(context, ContainerMode::Init, options);
+    if (!prepared) {
+        return LINGLONG_ERR(prepared);
+    }
+
+    auto res = this->configureInitContainer(*prepared);
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    return this->finalizeContainer(*prepared);
+}
+
+auto ContainerBuilder::configureRunContainer(PreparedContainer &prepared,
+                                             const RunContainerOptions &options) noexcept
+  -> utils::error::Result<void>
+{
+    LINGLONG_TRACE("configure run container");
+
+    auto *homeEnv = ::getenv("HOME");
+    if (homeEnv == nullptr) {
+        return LINGLONG_ERR("HOME is not set");
+    }
+    std::filesystem::path homePath{ homeEnv };
+
+    prepared.cfgBuilder.setAnnotation(generator::ANNOTATION::LAST_PID, std::to_string(::getpid()))
+      .bindUserGroup(true)
+      .bindXDGRuntime()
+      .bindRemovableStorageMounts()
+      .bindHostRoot()
+      .bindHostStatics()
+      .bindHome(homePath)
+      .enablePrivateDir()
+      .mapPrivate((homePath / ".ssh").string(), true)
+      .mapPrivate((homePath / ".gnupg").string(), true)
+      .bindIPC()
+      .forwardDefaultEnv();
+
+    if (!options.isXdpDisabled()) {
+        auto docMountPoint = getXDPDocumentsMountPoint();
+        if (docMountPoint) {
+            prepared.cfgBuilder.enableXDP(generator::XdpOption{
+              .docMountPoint = std::move(*docMountPoint),
+            });
+        } else {
+            LogW("failed to get XDP Documents mount point: {}, skip XDP integration",
+                 docMountPoint.error());
+        }
+    }
+    if (options.isPipewireSocketMountEnabled()) {
+        auto pwSocketPath = common::xdg::getXDGRuntimeDir() / "pipewire-0";
+        prepared.cfgBuilder.enablePipewireSocketMount(
+          generator::PipewireMountOption{ .hostSocketPath = std::move(pwSocketPath) });
+    }
+    if (options.isAtSpiSocketMountEnabled()) {
+        auto atSpiSocketPath = common::xdg::getXDGRuntimeDir() / "at-spi" / "bus_0";
+        prepared.cfgBuilder.enableAtSpiSocketMount(
+          generator::AtSpiMountOption{ .hostSocketPath = std::move(atSpiSocketPath) });
+    }
+
+    if (options.isDevicePassthruEnabled()) {
+        prepared.cfgBuilder.bindDev(true);
+    } else {
+        prepared.cfgBuilder.bindDevNode();
+    }
+
+    std::error_code ec;
+    auto socketDir = prepared.context->getBundleDir() / "init";
+    std::filesystem::create_directories(socketDir, ec);
+    if (ec) {
+        return LINGLONG_ERR("failed to create init socket directory", ec);
+    }
+
+    prepared.cfgBuilder.addExtraMount(
+      ocppi::runtime::config::types::Mount{ .destination = "/run/linglong/init",
+                                            .options = std::vector<std::string>{ "bind" },
+                                            .source = socketDir.string(),
+                                            .type = "bind" });
+
+    if (!options.getEnv().empty()) {
+        prepared.cfgBuilder.appendEnv(options.getEnv());
+    }
+
+    std::vector<std::string> capabilities;
+    if (options.isPrivileged()) {
+        if (getuid() != 0) {
+            return LINGLONG_ERR("privileged mode requires running as root");
+        }
+
+        prepared.cfgBuilder.disableUserNamespace();
+        capabilities = { "CAP_CHOWN",    "CAP_DAC_OVERRIDE",     "CAP_FOWNER",     "CAP_FSETID",
+                         "CAP_KILL",     "CAP_NET_BIND_SERVICE", "CAP_SETFCAP",    "CAP_SETGID",
+                         "CAP_SETPCAP",  "CAP_SETUID",           "CAP_SYS_CHROOT", "CAP_NET_RAW",
+                         "CAP_NET_ADMIN" };
+    }
+
+    const auto &extraCapabilities = options.getCapabilities();
+    capabilities.insert(capabilities.end(), extraCapabilities.begin(), extraCapabilities.end());
+    prepared.cfgBuilder.setCapabilities(std::move(capabilities));
+
+    auto &runContext = *prepared.runContext;
+    for (const auto &type : options.getSecurityContexts()) {
+        auto manager = getSecurityContextManager(type);
+        if (!manager) {
+            auto msg = "failed to get security context manager: " + fromType(type);
+            return LINGLONG_ERR(msg.c_str());
+        }
+
+        auto securityContext = manager->createSecurityContext(runContext, *prepared.context);
+        if (!securityContext) {
+            auto msg = "failed to create security context: " + fromType(type);
+            return LINGLONG_ERR(msg.c_str());
+        }
+
+        auto res = (*securityContext)->apply(prepared.cfgBuilder);
+        if (!res) {
+            auto msg = "failed to apply security context: " + fromType(type);
+            return LINGLONG_ERR(msg.c_str(), res);
+        }
+
+        prepared.context->addSecurityContext(std::move(*securityContext));
+    }
+
+    if (runContext.getConfig().overlayfs) {
+        auto res = prepared.context->setupOverlayFS(runContext, false);
+        if (!res) {
+            return LINGLONG_ERR("setup overlayfs", res);
+        }
+        prepared.cfgBuilder.enableOverlayMode(prepared.context->getBundleDir() / "rootfs", true);
+    }
+
+    auto applyRes = runContext.setupCDIDevices(prepared.cfgBuilder, false);
+    if (!applyRes) {
+        return LINGLONG_ERR(applyRes);
+    }
+
+    auto addExtraMounts = [&prepared](const auto &mounts) {
+        if (!mounts) {
+            return;
+        }
+
+        for (const auto &m : *mounts) {
+            ocppi::runtime::config::types::Mount ociMount{
+                .destination = m.destination,
+                .gidMappings = {},
+                .options = m.options,
+                .source = m.source,
+                .type = m.type,
+                .uidMappings = {},
+            };
+            prepared.cfgBuilder.addExtraMount(ociMount);
+        }
+    };
+
+    const auto &config = runContext.getConfig();
+    addExtraMounts(config.hostDynamic);
+    addExtraMounts(config.mounts);
+
+    return LINGLONG_OK;
+}
+
+auto ContainerBuilder::createRunContainer(runtime::RunContext &context,
+                                          const RunContainerOptions &options) noexcept
+  -> utils::error::Result<std::unique_ptr<Container>>
+{
+    LINGLONG_TRACE("create run container");
+
+    auto prepared = this->prepareContainer(context, ContainerMode::Run, options.common);
+    if (!prepared) {
+        return LINGLONG_ERR(prepared);
+    }
+
+    if (!options.lockName.empty()) {
+        const auto lockPath = prepared->context->getBundleDir() / options.lockName;
+        prepared->cfgBuilder.addExtraMount({
+          .destination = common::dir::containerLockPath,
+          .options = std::vector<std::string>{ "bind" },
+          .source = lockPath.string(),
+          .type = "bind",
+        });
+    }
+
+    auto res = this->configureRunContainer(*prepared, options);
+    if (!res) {
+        return LINGLONG_ERR(res);
+    }
+
+    return this->finalizeContainer(*prepared);
 }
 
 } // namespace linglong::runtime

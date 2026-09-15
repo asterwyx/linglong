@@ -1,26 +1,35 @@
-// SPDX-FileCopyrightText: 2024 UnionTech Software Technology Co., Ltd.
+// SPDX-FileCopyrightText: 2024 - 2026 UnionTech Software Technology Co., Ltd.
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include "linglong/api/types/v1/Generators.hpp"
-#include "linglong/api/types/v1/OciConfigurationPatch.hpp"
-#include "ocppi/runtime/config/types/Config.hpp"
-#include "ocppi/runtime/config/types/Generators.hpp"
+#include "linglong/api/types/v1/Generators.hpp" // IWYU pragma: keep
+#include "linglong/common/strings.h"
+#include "linglong/oci-cfg-generators/container_cfg_builder.h"
+#include "ocppi/runtime/config/types/Generators.hpp" // IWYU pragma: keep
+#include "ocppi/runtime/config/types/Hook.hpp"
+#include "ocppi/runtime/config/types/Linux.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
-#include <thread>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+
+std::filesystem::path containerBundle;
 
 std::string genRandomString() noexcept
 {
@@ -29,7 +38,7 @@ std::string genRandomString() noexcept
     std::uniform_int_distribution<char> dist('A', 'z');
 
     std::string ret;
-    while (ret.size() < 81) {
+    while (ret.size() < 16) {
         auto val = dist(gen);
         if (val >= '[' && val <= '`') {
             continue;
@@ -40,382 +49,434 @@ std::string genRandomString() noexcept
     return ret;
 }
 
-template<typename Func>
-struct defer
+void cleanResource()
 {
-    explicit defer(Func newF)
-        : f(std::move(newF))
-    {
+    if (containerBundle.empty()) {
+        return;
     }
 
-    ~defer() { f(); }
-
-private:
-    Func f;
-};
-
-bool applyJSONPatch(ocppi::runtime::config::types::Config &cfg,
-                    const linglong::api::types::v1::OciConfigurationPatch &patch) noexcept
-{
-    if (patch.ociVersion != cfg.ociVersion) {
-        std::cerr << "ociVersion mismatched" << std::endl;
-        return false;
+    if (::getenv("LINGLONG_UAB_DEBUG") != nullptr) {
+        return;
     }
 
-    auto raw = nlohmann::json(cfg);
+    std::error_code ec;
+    if (std::filesystem::remove_all(containerBundle, ec) == static_cast<std::uintmax_t>(-1) && ec) {
+        std::cerr << "failed to remove directory " << containerBundle << ":" << ec.message()
+                  << std::endl;
+        return;
+    }
+    containerBundle.clear();
+}
+
+[[noreturn]] void cleanAndExit(int exitCode) noexcept
+{
+    cleanResource();
+    ::_exit(exitCode);
+}
+
+void handleSig() noexcept
+{
+    sigset_t blocking_mask;
+    sigemptyset(&blocking_mask);
+    auto quitSignals = { SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGABRT };
+    for (auto sig : quitSignals) {
+        sigaddset(&blocking_mask, sig);
+    }
+
+    struct sigaction sa{};
+
+    sa.sa_handler = [](int sig) -> void {
+        cleanAndExit(128 + sig);
+    };
+    sa.sa_mask = blocking_mask;
+    sa.sa_flags = 0;
+
+    for (auto sig : quitSignals) {
+        sigaction(sig, &sa, nullptr);
+    }
+}
+
+std::optional<linglong::api::types::v1::PackageInfoV2>
+loadPackageInfoFromJson(const std::filesystem::path &json) noexcept
+{
+    std::ifstream stream{ json };
+    if (!stream.is_open()) {
+        std::cerr << "couldn't open " << json << std::endl;
+        return std::nullopt;
+    }
+
     try {
-        raw = raw.patch(patch.patch);
-        cfg = raw.get<ocppi::runtime::config::types::Config>();
-    } catch (nlohmann::json::parse_error &e) {
-        std::cerr << "patch parser error:" << e.what() << std::endl;
-        return false;
-    } catch (nlohmann::json::out_of_range &e) {
-        std::cerr << "patch out of range:" << e.what() << std::endl;
-        return false;
-    } catch (...) {
-        std::cerr << "unknown exception" << std::endl;
+        auto content = nlohmann::json::parse(stream);
+        return content.get<linglong::api::types::v1::PackageInfoV2>();
+    } catch (const std::exception &err) {
+        std::cout << "catching exception: " << err.what() << std::endl;
+    }
+
+    std::cout << "fallback to PackageInfoV1" << std::endl;
+    stream.seekg(0);
+
+    try { // TODO: use public fallback method on later
+        auto content = nlohmann::json::parse(stream);
+        auto oldInfo = content.get<linglong::api::types::v1::PackageInfo>();
+        return linglong::api::types::v1::PackageInfoV2{
+            .arch = oldInfo.arch,
+            .base = oldInfo.base,
+            .channel = oldInfo.channel.value_or("main"),
+            .command = oldInfo.command,
+            .description = oldInfo.description,
+            .id = oldInfo.appid,
+            .kind = oldInfo.kind,
+            .packageInfoV2Module = oldInfo.packageInfoModule,
+            .name = oldInfo.name,
+            .permissions = oldInfo.permissions,
+            .runtime = oldInfo.runtime,
+            .schemaVersion = "1.0",
+            .size = oldInfo.size,
+            .version = oldInfo.version,
+        };
+    } catch (const nlohmann::json::parse_error &err) {
+        std::cerr << "parsing error: " << err.what() << std::endl;
+    } catch (const nlohmann::json::out_of_range &err) {
+        std::cerr << "parsing out of range:" << err.what() << std::endl;
+    } catch (const std::exception &err) {
+        std::cout << "catching exception: " << err.what() << std::endl;
+    }
+
+    return std::nullopt;
+}
+
+bool processLDConfig(linglong::generator::ContainerCfgBuilder &builder,
+                     const std::string &arch) noexcept
+{
+    std::optional<std::string> triplet;
+    if (arch == "x86_64") {
+        triplet = "x86_64-linux-gnu";
+    } else if (arch == "arm64") {
+        triplet = "aarch64-linux-gnu";
+    } else if (arch == "loong64" || arch == "loongarch64") {
+        triplet = "loongarch64-linux-gnu";
+    } else if (arch == "sw64") {
+        triplet = "sw_64-linux-gnu";
+    } else if (arch == "mips64") {
+        triplet = "mips64el-linux-gnuabi64";
+    }
+
+    if (!triplet) {
+        std::cerr << "unsupported architecture" << std::endl;
         return false;
     }
+
+    auto content = builder.ldConf(triplet.value());
+    auto ldConf = containerBundle / "ld.so.conf";
+    {
+        std::ofstream stream{ ldConf };
+        if (!stream.is_open()) {
+            std::cout << "failed to open " << ldConf.string() << std::endl;
+            return false;
+        }
+
+        stream << content;
+    }
+
+    // trigger fixMount
+    auto randomFile = containerBundle / genRandomString();
+    {
+        std::ofstream stream{ randomFile };
+        if (!stream.is_open()) {
+            std::cout << "failed to open " << ldConf.string() << std::endl;
+            return false;
+        }
+    }
+
+    builder.addExtraMounts(std::vector<ocppi::runtime::config::types::Mount>{
+      ocppi::runtime::config::types::Mount{
+        .destination = "/etc/" + randomFile.filename().string(),
+        .options = { { "ro", "bind" } },
+        .source = randomFile,
+        .type = "bind",
+      },
+      ocppi::runtime::config::types::Mount{
+        .destination = "/etc/ld.so.conf.d/zz_deepin-linglong.ld.so.conf",
+        .options = { { "ro", "bind" } },
+        .source = ldConf,
+        .type = "bind",
+      } });
+
+    builder.setStartContainerHooks(std::vector<ocppi::runtime::config::types::Hook>{
+      ocppi::runtime::config::types::Hook{
+        .args = std::vector<std::string>{ "/sbin/ldconfig", "-C", "/tmp/ld.so.cache" },
+        .path = "/sbin/ldconfig",
+      },
+      ocppi::runtime::config::types::Hook{
+        .args =
+          std::vector<std::string>{ "/bin/sh", "-c", "cat /tmp/ld.so.cache > /etc/ld.so.cache" },
+        .path = "/bin/sh",
+      } });
 
     return true;
 }
 
-void applyJSONFilePatch(ocppi::runtime::config::types::Config &cfg,
-                        const std::filesystem::path &info) noexcept
+bool processProfile(const std::filesystem::path &extraDir,
+                    linglong::generator::ContainerCfgBuilder &builder)
 {
-    std::string_view suffix{ ".json" };
-    auto fileName = info.filename().string();
-    if (fileName.compare(fileName.size() - suffix.size(), suffix.size(), suffix) != 0) {
-        std::cerr << "file not ends with " << suffix << std::endl;
-        return;
-    }
+    std::error_code ec;
 
-    std::ifstream stream{ info };
-    if (!stream.is_open()) {
-        std::cerr << "couldn't open file " << info << std::endl;
-        return;
-    }
+    auto tripletFile = extraDir / "linglong-triplet-list";
+    if (!std::filesystem::exists(tripletFile, ec)) {
+        if (ec) {
+            std::cerr << "failed to get directory " << extraDir << ":" << ec.message()
+                      << " code:" << ec.value() << std::endl;
+            return false;
+        }
 
-    linglong::api::types::v1::OciConfigurationPatch patch;
-    try {
-        auto content = nlohmann::json::parse(stream);
-        patch = content.get<linglong::api::types::v1::OciConfigurationPatch>();
-    } catch (nlohmann::json::parse_error &e) {
-        std::cerr << "parse json file(" << info << ") error:" << e.what() << std::endl;
-        return;
-    } catch (...) {
-        std::cerr << "unknown exception" << std::endl;
-        return;
+        return true;
     }
+    builder.addExtraMount(ocppi::runtime::config::types::Mount{
+      .destination = "/etc/linglong-triplet-list",
+      .options = { { "ro", "bind" } },
+      .source = tripletFile,
+      .type = "bind",
+    });
 
-    applyJSONPatch(cfg, patch);
+    auto profile = extraDir / "profile";
+    if (!std::filesystem::exists(profile, ec)) {
+        if (ec) {
+            std::cerr << "failed to get directory " << extraDir << ":" << ec.message()
+                      << " code:" << ec.value() << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+    builder.addExtraMount(ocppi::runtime::config::types::Mount{
+      .destination = "/etc/profile",
+      .options = { { "ro", "bind" } },
+      .source = profile,
+      .type = "bind",
+    });
+
+    return true;
 }
 
-void applyExecutablePatch(ocppi::runtime::config::types::Config &cfg,
-                          const std::filesystem::path &info) noexcept
+bool generateEntrypoint(linglong::generator::ContainerCfgBuilder &builder,
+                        std::vector<std::string> originalArgs) noexcept
 {
-    std::array<int, 2> inPipe{ -1, -1 };
-    std::array<int, 2> outPipe{ -1, -1 };
-    std::array<int, 2> errPipe{ -1, -1 };
-    if (::pipe(outPipe.data()) == -1) {
-        std::cerr << "pipe error:" << ::strerror(errno) << std::endl;
-        return;
+    std::string content = "#!/usr/bin/env bash\nsource /etc/profile\nexec ";
+    for (const auto &arg : originalArgs) {
+        content.append(linglong::common::strings::quoteBashArg(arg));
+        content.push_back(' ');
     }
 
-    auto clearPipe = [](int &fd) {
-        ::close(fd);
-        fd = -1;
-    };
-
-    auto closeInPipe = defer([&pipes = outPipe] {
-        for (auto &pipe : pipes) {
-            if (pipe != -1) {
-                ::close(pipe);
-            }
+    const auto entryPoint = containerBundle / "entrypoint.sh";
+    {
+        std::ofstream stream{ entryPoint };
+        if (!stream.is_open()) {
+            std::cerr << "failed to open file "
+                      << containerBundle / "entrypoint.sh:" << ::strerror(errno) << std::endl;
+            return false;
         }
+
+        stream << content;
+        if (stream.fail()) {
+            std::cerr << "failed to write entrypoint to " << entryPoint << std::endl;
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::permissions(entryPoint,
+                                 std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::add,
+                                 ec);
+    if (ec) {
+        std::cerr << "failed to set permission of " << entryPoint << ":" << ec.message()
+                  << std::endl;
+        return false;
+    }
+
+    builder.addExtraMount(ocppi::runtime::config::types::Mount{
+      .destination = "/entrypoint.sh",
+      .options = { { "bind", "ro" } },
+      .source = entryPoint,
+      .type = "bind",
     });
 
-    if (::pipe(errPipe.data()) == -1) {
-        std::cerr << "pipe error:" << ::strerror(errno) << std::endl;
-        return;
+    return true;
+}
+
+} // namespace
+
+// DO NOT USE LOADER DIRECTLY
+int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv) // NOLINT
+{
+    handleSig();
+
+    // This 'bundle' means uab bundle instead of OCI bundle
+    const auto &bundleDir = std::filesystem::read_symlink("/proc/self/exe").parent_path();
+    const auto &layersDir = bundleDir / "layers";
+
+    std::error_code ec;
+    if (!std::filesystem::exists(layersDir, ec) || ec) {
+        std::cerr << "couldn't find directory 'layers', maybe filesystem error:" << ec.message()
+                  << std::endl;
+        return -1;
     }
 
-    auto closeErrPipe = defer([&pipes = errPipe] {
-        for (auto &pipe : pipes) {
-            if (pipe != -1) {
-                ::close(pipe);
-            }
+    std::optional<linglong::api::types::v1::PackageInfoV2> appInfo;
+    for (const auto &layer : std::filesystem::directory_iterator{ layersDir, ec }) {
+        if (!layer.is_directory()) { // seeking layer directory
+            continue;
         }
-    });
 
-    if (::pipe(inPipe.data()) == -1) {
-        std::cerr << "pipe error:" << ::strerror(errno) << std::endl;
-        return;
-    }
-
-    auto closeOPipe = defer([&pipes = inPipe] {
-        for (auto &pipe : pipes) {
-            if (pipe != -1) {
-                ::close(pipe);
-            }
-        }
-    });
-
-    auto pid = fork();
-    if (pid < 0) {
-        std::cerr << "fork error:" << ::strerror(errno) << std::endl;
-        return;
-    }
-
-    if (pid == 0) {
-        ::dup2(inPipe[0], STDIN_FILENO);
-        ::dup2(outPipe[1], STDOUT_FILENO);
-        ::dup2(errPipe[1], STDERR_FILENO);
-
-        clearPipe(inPipe[1]);
-        clearPipe(errPipe[0]);
-        clearPipe(outPipe[0]);
-
-        if (::execl(info.c_str(), info.c_str(), nullptr) == -1) {
-            std::cerr << "execl " << info << " error:" << ::strerror(errno) << std::endl;
-            return;
-        }
-    }
-
-    clearPipe(inPipe[0]);
-    clearPipe(errPipe[1]);
-    clearPipe(outPipe[1]);
-
-    auto input = nlohmann::json(cfg).dump();
-    auto bytesWrite = input.size();
-    while (true) {
-        auto writeBytes = ::write(inPipe[1], input.c_str(), bytesWrite);
-        if (writeBytes == -1) {
-            if (errno == EINTR) {
+        bool foundApp{ false };
+        for (const auto &layerModule : std::filesystem::directory_iterator{ layer, ec }) {
+            if (!layerModule.is_directory()
+                || layerModule.path().filename()
+                  != "binary") { // we only need binary module to run the application
                 continue;
             }
 
-            return;
+            auto infoFile = layerModule.path() / "info.json";
+            auto info = loadPackageInfoFromJson(infoFile);
+            if (!info) {
+                std::cerr << "couldn't get meta info, exit" << std::endl;
+                return -1;
+            }
+
+            if (info->kind == "app") {
+                appInfo = std::move(info);
+                foundApp = true;
+                break;
+            }
         }
 
-        bytesWrite -= writeBytes;
-        if (bytesWrite == 0) {
+        if (ec) {
+            std::cerr << "uab internal module error: " << ec.message() << " code:" << ec.value()
+                      << std::endl;
+            return -1;
+        }
+
+        if (foundApp) {
             break;
         }
     }
-    clearPipe(inPipe[1]);
 
-    using namespace std::chrono_literals;
-    auto timeout = 400;
-    int wstatus{ -1 };
-    std::string err;
-    std::string out;
-
-    while (true) {
-        std::this_thread::sleep_for(100ms);
-        int child{ -1 };
-        if (child = ::waitpid(pid, &wstatus, WNOHANG); child == -1) {
-            std::cerr << "wait for process error:" << ::strerror(errno) << std::endl;
-            return;
-        }
-
-        if (child == 0) {
-            timeout -= 100;
-            if (timeout == 0) {
-                std::cerr << "generator " << info << " timeout" << std::endl;
-                return;
-            }
-            continue;
-        }
-
-        std::array<char, 4096> buf{};
-        int reads{ -1 };
-        while ((reads = ::read(errPipe[0], buf.data(), buf.size())) != 0) {
-            if (reads < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                std::cerr << "read error:" << strerror(errno) << std::endl;
-                return;
-            }
-
-            std::copy_n(buf.cbegin(), reads, std::back_inserter(err));
-        }
-
-        reads = -1;
-        while ((reads = ::read(outPipe[0], buf.data(), buf.size())) != 0) {
-            if (reads < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                std::cerr << "read error:" << ::strerror(errno) << std::endl;
-                return;
-            }
-
-            std::copy_n(buf.cbegin(), reads, std::back_inserter(out));
-        }
-
-        break;
-    }
-
-    auto exitCode = WEXITSTATUS(wstatus);
-    if (exitCode != 0) {
-        std::cerr << "generator " << info << " return " << exitCode << std::endl;
-        std::cerr << "input:" << input << "stderr:" << err << std::endl;
-        return;
-    }
-
-    if (!err.empty()) {
-        std::cerr << "generator " << info << " stderr:" << err << std::endl;
-    }
-
-    nlohmann::json modified;
-    try {
-        auto content = nlohmann::json::parse(out);
-        modified = content.get<ocppi::runtime::config::types::Config>();
-    } catch (nlohmann::json::parse_error &e) {
-        std::cerr << "parse output error: " << e.what() << std::endl;
-        return;
-    } catch (...) {
-        std::cerr << "unknown exception occurred during parsing output" << std::endl;
-        return;
-    }
-
-    clearPipe(errPipe[0]);
-    clearPipe(outPipe[0]);
-
-    cfg = std::move(modified);
-}
-
-void applyPatches(ocppi::runtime::config::types::Config &cfg,
-                  const std::vector<std::filesystem::path> &patches) noexcept
-{
-    auto testExec = [](std::filesystem::perms perm) {
-        using p = std::filesystem::perms;
-        return (perm & p::owner_exec) != p::none || (perm & p::group_exec) != p::none
-          || (perm & p::others_exec) != p::none;
-    };
-
-    std::error_code ec;
-    for (const auto &info : patches) {
-        if (!std::filesystem::is_regular_file(info, ec)) {
-            if (ec) {
-                std::cerr << "couldn't get file type of " << info << ": " << ec.message()
-                          << " ,skip." << std::endl;
-                continue;
-            }
-
-            std::cerr << info << " isn't a regular file, skip." << std::endl;
-            continue;
-        }
-
-        auto status = std::filesystem::status(info, ec);
-        if (ec) {
-            std::cerr << "couldn't get status of " << info << std::endl;
-            continue;
-        }
-
-        if (testExec(status.permissions())) {
-            applyExecutablePatch(cfg, info);
-            continue;
-        }
-
-        applyJSONFilePatch(cfg, info);
-    }
-}
-
-int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
-{
-    auto *runtimeID = ::getenv("UAB_RUNTIME_ID");
-
-    auto *baseID = ::getenv("UAB_BASE_ID");
-    if (baseID == nullptr) {
-        std::cerr << "couldn't get UAB_BASE_ID" << std::endl;
+    if (ec) {
+        std::cerr << "uab internal layer error: " << ec.message() << " code:" << ec.value()
+                  << std::endl;
         return -1;
     }
 
-    auto *appID = ::getenv("UAB_APP_ID");
-    if (appID == nullptr) {
-        std::cerr << "couldn't get UAB_APP_ID" << std::endl;
+    if (!appInfo) {
+        std::cerr << "couldn't find meta info of application" << std::endl;
         return -1;
     }
 
-    std::error_code ec;
+    if (appInfo->base.empty()) {
+        std::cerr << "couldn't find base of application" << std::endl;
+        return -1;
+    }
+
     auto containerID = genRandomString();
-    auto bundleDir = std::filesystem::current_path().parent_path().parent_path() / containerID;
-    if (!std::filesystem::create_directories(bundleDir, ec)) {
-        std::cerr << "couldn't create directory " << bundleDir << " :" << ec.message() << std::endl;
+    auto containerBundleDir = bundleDir.parent_path() / containerID;
+    if (!std::filesystem::create_directories(containerBundleDir, ec) && ec) {
+        std::cerr << "couldn't create directory " << containerBundleDir << " :" << ec.message()
+                  << std::endl;
         return -1;
     }
 
-    defer removeBundle{ [bundleDir]() noexcept {
-        std::error_code ec;
-        std::filesystem::remove_all(bundleDir, ec);
-        if (ec) {
-            std::cerr << "remove bundle error:" << ec.message() << std::endl;
-        }
-    } };
+    containerBundle = std::move(containerBundleDir);
 
-    auto extraDir = std::filesystem::current_path() / "extra";
+    if (std::atexit(cleanResource) != 0) {
+        std::cerr << "failed register exit handler" << std::endl;
+        return 1;
+    }
+
+    std::set_terminate([]() {
+        cleanResource();
+        std::abort();
+    });
+
+    auto uid = ::getuid();
+    auto gid = ::getgid();
+    linglong::generator::ContainerCfgBuilder builder;
+
+    auto runtimeLD = containerBundle / "ld.so.cache";
+    {
+        std::ofstream stream{ runtimeLD };
+        if (!stream) {
+            std::cerr << "failed to open file " << runtimeLD << std::endl;
+            return -1;
+        }
+    }
+
+    const auto &appID = appInfo->id;
+    builder.setAppId(appID)
+      .setBundlePath(containerBundle)
+      .setBasePath("/", false)
+      .enableSelfAdjustingMount()
+      .forwardEnv()
+      .addUIdMapping(uid, uid, 1)
+      .addGIdMapping(gid, gid, 1)
+      .addExtraMounts(
+        std::vector<ocppi::runtime::config::types::Mount>{ ocppi::runtime::config::types::Mount{
+                                                             .destination = "/etc/ld.so.cache",
+                                                             .options = { { "bind" } },
+                                                             .source = runtimeLD,
+                                                             .type = "bind",
+                                                           },
+                                                           ocppi::runtime::config::types::Mount{
+                                                             .destination = "/tmp",
+                                                             .options = { { "rbind" } },
+                                                             .source = "/tmp",
+                                                             .type = "bind",
+                                                           } })
+      .appendEnv("LINGLONG_APPID", appID);
+
+    auto extraDir = bundleDir / "extra";
     if (!std::filesystem::exists(extraDir, ec)) {
-        std::cerr << extraDir << " doesn't exist:" << ec.message() << std::endl;
+        if (ec) {
+            std::cerr << "failed to get directory " << extraDir << ":" << ec.message()
+                      << " code:" << ec.value() << std::endl;
+            return -1;
+        }
+
+        std::cerr << extraDir << " not exist." << std::endl;
         return -1;
     }
 
     auto boxBin = extraDir / "ll-box";
     if (!std::filesystem::exists(boxBin, ec)) {
-        std::cerr << boxBin << " doesn't exist:" << ec.message() << std::endl;
+        if (ec) {
+            std::cerr << "failed to get file " << boxBin << ":" << ec.message()
+                      << " code:" << ec.value() << std::endl;
+            return -1;
+        }
+
+        std::cerr << boxBin << " not exist." << std::endl;
         return -1;
     }
 
-    auto containerCfgDir = extraDir / "container";
-    if (!std::filesystem::exists(containerCfgDir, ec)) {
-        std::cerr << containerCfgDir << " doesn't exist:" << ec.message() << std::endl;
-        return -1;
-    }
-
-    auto initCfg = containerCfgDir / "config.json";
-    if (!std::filesystem::exists(initCfg, ec)) {
-        std::cerr << initCfg << " doesn't exist:" << ec.message() << std::endl;
-        return -1;
-    }
-
-    std::ifstream stream{ initCfg };
-    if (!stream.is_open()) {
-        std::cerr << "open container config error." << std::endl;
-        return -1;
-    }
-
-    ocppi::runtime::config::types::Config config;
-    try {
-        auto content = nlohmann::json::parse(stream);
-        config = content.get<ocppi::runtime::config::types::Config>();
-    } catch (nlohmann::json::parse_error &e) {
-        std::cerr << "parse container config failed: " << e.what() << std::endl;
-        return -1;
-    } catch (std::exception &e) {
-        std::cerr << "catch an exception:" << e.what() << std::endl;
-        return -1;
-    } catch (...) {
-        std::cerr << "catch an unknown exception." << std::endl;
-        return -1;
-    }
-
-    auto compatibleFilePath = [](std::string_view layerID) -> std::string {
+    auto compatibleFilePath = [&bundleDir](std::string_view layerID) -> std::filesystem::path {
         std::error_code ec;
-
-        auto layerDir = std::filesystem::current_path() / "layers" / layerID;
+        auto layerDir = bundleDir / "layers" / layerID;
         if (!std::filesystem::exists(layerDir, ec)) {
-            std::cerr << "container layer path: " << layerDir << "doesn't exist:" << ec.message()
-                      << std::endl;
+            if (ec) {
+                std::cerr << "get layer directory " << layerDir << " error:" << ec.message()
+                          << " code:" << ec.value() << std::endl;
+                return {};
+            }
+
+            std::cerr << layerDir << " not exist." << std::endl;
             return {};
         }
 
-        if (auto runtime = layerDir / "runtime/files"; std::filesystem::exists(runtime)) {
+        // ignore error code when directory doesn't exist
+        if (auto runtime = layerDir / "runtime" / "files"; std::filesystem::exists(runtime, ec)) {
             return runtime.string();
         }
 
-        if (auto binary = layerDir / "binary/files"; std::filesystem::exists(binary)) {
+        if (auto binary = layerDir / "binary" / "files"; std::filesystem::exists(binary, ec)) {
             return binary.string();
         }
 
@@ -423,152 +484,116 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
         return {};
     };
 
-    auto layerFilesDir = compatibleFilePath(baseID);
-    if (layerFilesDir.empty()) {
-        std::cerr << "couldn't get compatiblePath of base" << std::endl;
+    auto rootfs = containerBundle / "rootfs";
+    if (!std::filesystem::create_directories(rootfs, ec) && ec) {
+        std::cerr << "couldn't create directory " << rootfs << " :" << ec.message() << std::endl;
         return -1;
     }
 
-    config.root->path = std::move(layerFilesDir);
-    config.root->readonly = true;
+    std::string runtimeID;
+    if (appInfo->runtime) {
+        const auto &runtimeStr = appInfo->runtime.value();
 
-    // apply generators
-    auto generatorsDir = containerCfgDir / "config.d";
-    if (!std::filesystem::exists(generatorsDir, ec)) {
-        std::cerr << initCfg << " doesn't exist:" << ec.message() << std::endl;
-        return -1;
+        std::size_t begin{ 0 };
+        auto splitColon = std::find(runtimeStr.cbegin(), runtimeStr.cend(), ':');
+        if (splitColon != runtimeStr.cend()) {
+            begin = std::distance(runtimeStr.cbegin(), splitColon) + 1;
+        }
+
+        auto splitSlash = std::find(runtimeStr.cbegin(), runtimeStr.cend(), '/');
+        auto len = std::distance(runtimeStr.cbegin(), splitSlash) - begin;
+
+        if (begin + len > runtimeStr.size()) {
+            std::cerr << "runtime may not valid: " << runtimeStr << std::endl;
+            return -1;
+        }
+
+        runtimeID = runtimeStr.substr(begin, len);
     }
 
-    auto annotations = config.annotations.value_or(std::map<std::string, std::string>{});
-    annotations["org.deepin.linglong.appID"] = appID;
-
-    if (runtimeID != nullptr) {
-        layerFilesDir = compatibleFilePath(runtimeID);
-        if (layerFilesDir.empty()) {
+    std::filesystem::path runtimeLayerFilesDir;
+    if (!runtimeID.empty()) {
+        runtimeLayerFilesDir = compatibleFilePath(runtimeID);
+        if (runtimeLayerFilesDir.empty()) {
             std::cerr << "couldn't get compatiblePath of runtime" << std::endl;
             return -1;
         }
 
-        annotations["org.deepin.linglong.runtimeDir"] =
-          std::filesystem::path{ layerFilesDir }.parent_path();
+        builder.setRuntimePath(runtimeLayerFilesDir);
     }
 
-    layerFilesDir = compatibleFilePath(appID);
-    if (layerFilesDir.empty()) {
+    auto appLayerFilesDir = compatibleFilePath(appID);
+    if (appLayerFilesDir.empty()) {
         std::cerr << "couldn't get compatiblePath of application" << std::endl;
         return -1;
     }
+    builder.setAppPath(appLayerFilesDir);
 
-    auto appDir = std::filesystem::path{ layerFilesDir }.parent_path();
-
-    annotations["org.deepin.linglong.appDir"] = appDir.string();
-    config.annotations = std::move(annotations);
-
-    // replace commands
-    auto appInfo = appDir / "info.json";
-    std::ifstream appStream{ appInfo };
-    if (!appStream.is_open()) {
-        std::cerr << "couldn't open app info.json" << std::endl;
+    // generate ld.so.cache and font cache at runtime
+    if (!processLDConfig(builder, appInfo->arch[0])) {
+        std::cerr << "failed to processing ld config" << std::endl;
         return -1;
     }
 
-    std::vector<std::string> command;
-    try {
-        auto content = nlohmann::json::parse(appStream);
-        if (content.contains("command")) {
-            command = content["command"].get<std::vector<std::string>>();
-        }
-    } catch (nlohmann::json::parse_error &e) {
-        std::cerr << "parse container config failed: " << e.what() << std::endl;
-        return -1;
-    } catch (std::exception &e) {
-        std::cerr << "catch an exception:" << e.what() << std::endl;
-        return -1;
-    } catch (...) {
-        std::cerr << "catch an unknown exception." << std::endl;
+    // add extra profile
+    if (!processProfile(extraDir, builder)) {
+        std::cerr << "failed to processing profile" << std::endl;
         return -1;
     }
 
-    if (!command.empty()) {
-        config.process->args = command;
+    // generate entrypoint
+    auto command = appInfo->command.value_or(std::vector<std::string>{ "/bin/bash" });
+    for (int i = 1; i < argc; ++i) {
+        command.push_back(argv[i]);
     }
-
-    std::filesystem::directory_iterator it{ generatorsDir, ec };
-    if (ec) {
-        std::cerr << "construct directory iterator error:" << ec.message() << std::endl;
+    if (!generateEntrypoint(builder, command)) {
+        std::cerr << "failed to generate entrypoint" << std::endl;
         return -1;
     }
-
-    std::vector<std::filesystem::path> gens;
-    for (const auto &path : it) {
-        gens.emplace_back(path.path());
-    }
-
-    applyPatches(config, gens);
-
-    // append ld conf
-    auto ldConfDir = extraDir / "ld.conf.d";
-    if (!std::filesystem::exists(ldConfDir)) {
-        std::cerr << "ld config directory doesn't exist" << std::endl;
-        return -1;
-    }
-
-    config.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.conf.d/zz_deepin-linglong-app.conf",
-      .options = { { "ro", "rbind" } },
-      .source = ldConfDir / "zz_deepin-linglong-app.ld.so.conf",
-      .type = "bind",
-    });
-
-    {
-        std::ofstream ofs(bundleDir / "ld.so.cache");
-        if (!ofs.is_open()) {
-            std::cerr << "create ld config in bundle directory" << std::endl;
-            return -1;
-        }
-        ofs.close();
-    }
-    config.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.cache",
-      .options = { { "rbind" } },
-      .source = bundleDir / "ld.so.cache",
-      .type = "bind",
-    });
-
-    {
-        std::ofstream ofs(bundleDir / "ld.so.cache~");
-        if (!ofs.is_open()) {
-            std::cerr << "create ld config in bundle directory" << std::endl;
-            return -1;
-        }
-        ofs.close();
-    }
-    config.mounts->push_back(ocppi::runtime::config::types::Mount{
-      .destination = "/etc/ld.so.cache~",
-      .options = { { "rbind" } },
-      .source = bundleDir / "ld.so.cache~",
-      .type = "bind",
-    });
 
     // dump to bundle
-    auto bundleCfg = bundleDir / "config.json";
-    std::ofstream cfgStream{ bundleCfg.string() };
-    if (!cfgStream.is_open()) {
-        std::cerr << "couldn't create bundle config.json" << std::endl;
-        return -1;
+    auto bundleCfg = containerBundle / "config.json";
+    nlohmann::json json;
+    {
+        std::ofstream cfgStream{ bundleCfg.string() };
+        if (!cfgStream.is_open()) {
+            std::cerr << "couldn't create bundle config.json" << std::endl;
+            return -1;
+        }
+
+        auto res = builder.build();
+        if (!res) {
+            std::cerr << "failed to generate OCI config:" << res.error().message() << std::endl;
+            return -1;
+        }
+
+        // for only-App, we need adjust some config
+        json = builder.getConfig();
+        auto process = json["process"].get<ocppi::runtime::config::types::Process>();
+        process.terminal = (::isatty(STDOUT_FILENO) == 1);
+        process.user = ocppi::runtime::config::types::User{ .gid = getgid(), .uid = getuid() };
+        process.args = std::vector<std::string>{ "/entrypoint.sh" };
+        json["process"] = std::move(process);
+
+        auto linux_ = json["linux"].get<ocppi::runtime::config::types::Linux>();
+        linux_.namespaces = std::vector<ocppi::runtime::config::types::NamespaceReference>{
+            ocppi::runtime::config::types::NamespaceReference{
+              .type = ocppi::runtime::config::types::NamespaceType::User },
+            ocppi::runtime::config::types::NamespaceReference{
+              .type = ocppi::runtime::config::types::NamespaceType::Mount }
+        };
+        json["linux"] = std::move(linux_);
+
+        cfgStream << json.dump() << std::endl;
+        cfgStream.close();
     }
 
-    nlohmann::json json = config;
-    cfgStream << json.dump() << std::endl;
-    cfgStream.close();
-
     if (::getenv("LINGLONG_UAB_DEBUG") != nullptr) {
-        std::cout << "dump container:" << std::endl;
+        std::cout << "dump container config:" << std::endl;
         std::cout << json.dump(4) << std::endl;
     }
 
-    auto bundleArg = "--bundle=" + bundleDir.string();
-
+    auto bundleArg = "--bundle=" + containerBundle.string();
     auto pid = fork();
     if (pid < 0) {
         std::cerr << "fork() err: " << ::strerror(errno) << std::endl;
@@ -586,11 +611,22 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
                        nullptr);
     }
 
-    int wstatus{ -1 };
+    int wstatus{ 0 };
     if (auto ret = ::waitpid(pid, &wstatus, 0); ret == -1) {
         std::cerr << "waitpid() err:" << ::strerror(errno) << std::endl;
         return -1;
     }
 
-    return WEXITSTATUS(wstatus);
+    if (WIFEXITED(wstatus)) {
+        std::cerr << "loader: container exit: " << WEXITSTATUS(wstatus) << std::endl;
+        return WEXITSTATUS(wstatus);
+    }
+
+    if (WIFSIGNALED(wstatus)) {
+        std::cerr << "loader: container exit with signal: " << WTERMSIG(wstatus) << std::endl;
+        return WTERMSIG(wstatus) + 128;
+    }
+
+    std::cerr << "unknown exit status" << std::endl;
+    return -1;
 }

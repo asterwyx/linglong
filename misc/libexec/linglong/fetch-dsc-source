@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
+# SPDX-FileCopyrightText: 2023 - 2026 UnionTech Software Technology Co., Ltd.
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
 set -e
@@ -10,14 +10,14 @@ url=$2
 digest=$3
 cachedir=$4
 
-# Check command tools 
+# Check command tools
 if ! command -v dget
 then
     echo "dget not found, please install devscripts first"
     exit 1;
 fi
 
-# Clean up old directorie and create parent directory
+# Clean up old directory and create parent directory
 mkdir -p "$outputdir"
 rm -r "$outputdir"
 # Check cache

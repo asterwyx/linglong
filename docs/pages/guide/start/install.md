@@ -4,60 +4,203 @@ SPDX-FileCopyrightText: 2023 UnionTech Software Technology Co., Ltd.
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 
-# 安装玲珑
+# 安装如意玲珑
 
-玲珑由三部分组成
+deepin/UOS 的部分版本已经预装如意玲珑。请先执行 `ll-cli --version`；如果命令可用，可以直接继续[快速上手](./quick-start.md)。其他 Linux 发行版请按本页对应小节配置软件源并安装。普通用户至少需要安装 `linglong-bin`，构建应用的开发者还需要安装 `linglong-builder`。
 
-- ll-builder 用来构建和调试玲珑应用，由 linglong-builder 提供。
-- ll-box 沙箱容器，由 linglong-box 提供。
-- ll-cli 管理和运行玲珑应用，由 linglong-bin 提供。
+如意玲珑命令行工具主要包括：
 
-## deepin v23
+- `ll-cli` 管理和运行如意玲珑应用，由 `linglong-bin` 提供。
+- `ll-builder` 用来构建和调试如意玲珑应用，由 `linglong-builder` 提供。
 
-```bash
-sudo apt install linglong-builder linglong-box linglong-bin
+:::warning 存储文件系统
+
+如意玲珑的本地仓库使用 OSTree。目前，OSTree 在 ZFS 上存在严重的写入性能问题。
+
+安装前，请确认如意玲珑的仓库和数据目录不在 ZFS 文件系统上。
+建议使用 ext4、XFS 等其他 Linux 文件系统。
+
+相关背景：
+
+- [Linyaps Issue #1107](https://github.com/OpenAtom-Linyaps/linyaps/issues/1107)
+- [OpenZFS Issue #11140](https://github.com/openzfs/zfs/issues/11140)
+
+:::
+
+## 仓库使用说明
+
+### release 仓库
+
+基于最新tag自动构建
+
+1. 仓库地址 <https://ci.deepin.com/repo/obs/linglong:/CI:/release>
+2. 构建地址 <https://build.deepin.com/project/show/linglong:CI:release>
+
+### latest 仓库
+
+基于最新提交自动构建
+
+1. 仓库地址 <https://ci.deepin.com/repo/obs/linglong:/CI:/latest>
+2. 构建地址 <https://build.deepin.com/project/show/linglong:CI:latest>
+
+:::tip
+
+以下安装步骤均使用 release 仓库，以获得当前稳定版本。如果想体验还未发布的功能，将仓库地址中的 `release` 改为 `latest`，即可安装基于主分支构建的预览版。预览版可能包含未完成的功能，不建议用于生产环境。
+
+:::
+
+## 如意玲珑安装说明
+
+### Arch / Manjaro / Parabola Linux
+
+```sh
+sudo pacman -Syu linyaps
 ```
 
-## UOS 1070
-
-添加玲珑仓库源
+如意玲珑网页商店安装工具需要通过 [AUR 仓库](https://aur.archlinux.org/packages/linyaps-web-store-installer) 或 [自建源仓库](https://github.com/taotieren/aur-repo) 安装。
 
 ```bash
-echo "deb [trusted=yes] https://ci.deepin.com/repo/deepin/deepin-community/linglong-repo/ unstable main" | sudo tee -a /etc/apt/sources.list
+# AUR
+yay -Syu linyaps-web-store-installer
+# 或自建源
+sudo pacman -Syu linyaps-web-store-installer
 ```
 
-```bash
+### deepin 25
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Deepin_25/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
 sudo apt update
-sudo apt install linglong-builder linglong-box linglong-bin
+sudo apt install linglong-bin linglong-installer
 ```
 
-## OpenEuler
+### deepin 23
 
-添加玲珑仓库源
-
-```bash
-sudo curl -o /etc/yum.repos.d/linglong.repo -L https://eur.openeuler.openatom.cn/coprs/kamiyadm/linglong/repo/openeuler-24.03_LTS/kamiyadm-linglong-openeuler-24.03_LTS.repo
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Deepin_23/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
 ```
 
-```bash
+### Fedora 41
+
+```sh
+sudo dnf config-manager addrepo --from-repofile "https://ci.deepin.com/repo/obs/linglong:/CI:/release/Fedora_41/linglong%3ACI%3Arelease.repo"
 sudo dnf update
-sudo dnf install linglong-builder linglong-box linglong-bin
+sudo dnf install linglong-bin linyaps-web-store-installer
 ```
 
-# 安装 pica
+### Fedora 42
 
-本工具目前提供 deb 包转换为玲珑包的能力，生成构建玲珑应用需要的 linglong.yaml 文件，并依赖 ll-builder 来实现应用构建和导出。
+```sh
+sudo dnf config-manager addrepo --from-repofile "https://ci.deepin.com/repo/obs/linglong:/CI:/release/Fedora_42/linglong%3ACI%3Arelease.repo"
+sudo dnf update
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
 
-## deepin v23
+### Ubuntu 24.04
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Debian 12
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Debian_12/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### Debian 13
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Debian_13/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### openEuler 23.09
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/openEuler_23.09/linglong%3ACI%3Arelease.repo"
+sudo sh -c "echo gpgcheck=0 >> /etc/yum.repos.d/linglong%3ACI%3Arelease.repo"
+sudo dnf update
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### openEuler 24.03
+
+```sh
+sudo dnf config-manager --add-repo "https://ci.deepin.com/repo/obs/linglong:/CI:/release/openEuler_24.03/linglong%3ACI%3Arelease.repo"
+sudo sh -c "echo gpgcheck=0 >> /etc/yum.repos.d/linglong%3ACI%3Arelease.repo"
+sudo dnf update
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### UOS 1070
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/uos_1070/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### AnolisOS 8
+
+```sh
+sudo dnf config-manager addrepo --from-repofile "https://ci.deepin.com/repo/obs/linglong:/CI:/release/AnolisOS_8/linglong%3ACI%3Arelease.repo"
+sudo dnf update
+sudo dnf install linglong-bin linyaps-web-store-installer
+```
+
+### openkylin 2.0
+
+```sh
+echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/openkylin_2.0/ ./" | sudo tee /etc/apt/sources.list.d/linglong.list
+sudo apt update
+sudo apt install linglong-bin linglong-installer
+```
+
+### NixOS
+
+在 NixOS 25.11或以上版本中，修改配置文件(一般是`/etc/nixos/configuration.nix`), 添加：
+
+```nix
+  services.linyaps.enable = true;
+```
+
+## 如意玲珑构建工具安装说明
+
+### Debian系
+
+```bash
+sudo apt install linglong-builder
+```
+
+### RPM系
+
+```bash
+sudo dnf install linglong-builder
+```
+
+## 如意玲珑转换工具安装说明
+
+### Deepin 23/25
 
 ```bash
 sudo apt install linglong-pica
 ```
 
-## UOS 1070
+### Arch Linux
 
-需要添加仓库源，前面已添加。
+通过 [AUR 仓库](https://aur.archlinux.org/packages/linglong-pica) 或 [自建源仓库](https://github.com/taotieren/aur-repo) 安装。
 
 ```bash
-sudo apt install linglong-pica
+# AUR
+yay -Syu linglong-pica
+# 或自建源
+sudo pacman -Syu linglong-pica
 ```

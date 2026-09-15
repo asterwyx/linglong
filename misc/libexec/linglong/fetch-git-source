@@ -11,7 +11,7 @@ url=$2
 commit=$3
 # cachedir=$4
 
-# Check command tools 
+# Check command tools
 if ! command -v git
 then
     echo "git not found, please install git first"
@@ -31,8 +31,10 @@ fi
 # Fetch commit
 git fetch origin "$commit" --depth 1 -n
 git add :/
-git reset --hard "$commit"
+git reset --hard FETCH_HEAD
 
 # Fetch submodule
-git submodule update --init --recursive --depth 1
-git submodule foreach git reset --hard HEAD
+if [ -n "$GIT_SUBMODULES" ]; then
+    git submodule update --init --recursive --depth 1
+    git submodule foreach git reset --hard HEAD
+fi

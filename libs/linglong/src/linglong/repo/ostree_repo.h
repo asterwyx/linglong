@@ -1,38 +1,71 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_SRC_MODULE_REPO_OSTREE_REPO_H_
-#define LINGLONG_SRC_MODULE_REPO_OSTREE_REPO_H_
+#pragma once
 
-#include "linglong/api/types/v1/RepoConfig.hpp"
+#include "linglong/api/types/v1/PackageInfoV2.hpp"
+#include "linglong/api/types/v1/Repo.hpp"
+#include "linglong/api/types/v1/RepoConfigV2.hpp"
 #include "linglong/package/fuzzy_reference.h"
 #include "linglong/package/layer_dir.h"
 #include "linglong/package/reference.h"
-#include "linglong/package_manager/task.h"
+#include "linglong/package_manager/package_task.h"
 #include "linglong/repo/client_factory.h"
+#include "linglong/repo/config.h"
+#include "linglong/repo/remote_packages.h"
+#include "linglong/repo/repo_cache.h"
 #include "linglong/utils/error/error.h"
 
 #include <ostree.h>
 
-#include <QHttpPart>
-#include <QList>
-#include <QPointer>
-#include <QProcess>
-#include <QScopedPointer>
-#include <QThread>
+#include <QDir>
+
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace linglong::repo {
 
-struct clearReferenceOption
+class RefMetaData
 {
-    bool forceRemote = false;
-    bool fallbackToRemote = true;
+public:
+    RefMetaData(const std::string_view &rev)
+        : rev(rev)
+    {
+    }
+
+    RefMetaData(const std::string_view &rev, const std::string_view &packageInfo)
+        : rev(rev)
+        , packageInfoContent(packageInfo)
+    {
+    }
+
+    utils::error::Result<api::types::v1::PackageInfoV2> getPackageInfo() const noexcept;
+
+    std::string getRev() const noexcept { return rev; }
+
+private:
+    std::string rev;
+    std::string packageInfoContent;
+};
+
+struct RefStatistics
+{
+    uint64_t archived;
+    uint64_t unpacked;
+    uint64_t objects;
+    uint64_t needed_archived;
+    uint64_t needed_unpacked;
+    uint64_t needed_objects;
 };
 
 class OSTreeRepo : public QObject
+
 {
     Q_OBJECT
 public:
@@ -40,69 +73,218 @@ public:
     OSTreeRepo(OSTreeRepo &&) = delete;
     OSTreeRepo &operator=(const OSTreeRepo &) = delete;
     OSTreeRepo &operator=(OSTreeRepo &&) = delete;
-    OSTreeRepo(const QDir &path,
-               const api::types::v1::RepoConfig &cfg,
-               ClientFactory &clientFactory) noexcept;
+
+    // Load existing repo from path, config is loaded from config.yaml
+    // Opens existing ostree repo and cache
+    // Returns error if any step fails
+    static utils::error::Result<std::unique_ptr<OSTreeRepo>>
+    loadFromPath(std::filesystem::path repoRoot) noexcept;
+
+    // load or create repo with explicit config
+    // Tries to open existing ostree repo, creates if load failed
+    static utils::error::Result<std::unique_ptr<OSTreeRepo>>
+    create(std::filesystem::path repoRoot, api::types::v1::RepoConfigV2 cfg) noexcept;
 
     ~OSTreeRepo() override;
 
-    api::types::v1::RepoConfig getConfig() const noexcept;
-    utils::error::Result<void> setConfig(const api::types::v1::RepoConfig &cfg) noexcept;
+    [[nodiscard]] const api::types::v1::RepoConfigV2 &getConfig() const noexcept;
+    [[nodiscard]] api::types::v1::RepoConfigV2 getOrderedConfig() const noexcept;
+    [[nodiscard]] utils::error::Result<api::types::v1::Repo>
+    getRepoByAlias(const std::string &alias) const noexcept;
+    [[nodiscard]] virtual std::vector<std::vector<api::types::v1::Repo>>
+    getPriorityGroupedRepos() const noexcept;
+    utils::error::Result<void> setConfig(const api::types::v1::RepoConfigV2 &cfg) noexcept;
 
-    utils::error::Result<package::LayerDir> importLayerDir(const package::LayerDir &dir,
-                                                           const QString &subRef = "") noexcept;
+    utils::error::Result<api::types::v1::RepositoryCacheLayersItem> importLayerDir(
+      const package::LayerDir &dir, std::vector<std::filesystem::path> overlays = {}) noexcept;
 
-    utils::error::Result<package::LayerDir> getLayerDir(const package::Reference &ref,
-                                                        bool develop = false,
-                                                        const QString &subRef = "") const noexcept;
+    virtual utils::error::Result<package::LayerDir>
+    getLayerDir(const package::Reference &ref, const std::string &module = "binary") const noexcept;
+    [[nodiscard]] utils::error::Result<void>
+    push(const package::Reference &reference, const std::string &module = "binary") const noexcept;
 
-    utils::error::Result<void> push(const package::Reference &reference,
-                                    bool develop = false) const noexcept;
+    [[nodiscard]] utils::error::Result<void>
+    pushToRemote(const std::string &remoteRepo,
+                 const std::string &url,
+                 const package::Reference &reference,
+                 const std::string &module = "binary") const noexcept;
+    [[nodiscard]] virtual utils::error::Result<void> pull(service::Task &taskContext,
+                                                          const package::ReferenceWithRepo &refRepo,
+                                                          const std::string &module) noexcept;
 
-    void pull(service::InstallTask &taskContext,
-              const package::Reference &reference,
-              bool develop = false) noexcept;
+    [[nodiscard]] virtual utils::error::Result<package::Reference> clearReferenceLocal(
+      const package::FuzzyReference &fuzzyRef, bool semanticMatching = false) const noexcept;
 
-    utils::error::Result<package::Reference> clearReference(
-      const package::FuzzyReference &fuzz, const clearReferenceOption &opts) const noexcept;
+    virtual utils::error::Result<std::vector<api::types::v1::PackageInfoV2>>
+    listLocal() const noexcept;
+    utils::error::Result<std::vector<api::types::v1::PackageInfoV2>> virtual searchRemote(
+      std::string searching, const api::types::v1::Repo &repo) const noexcept;
+    utils::error::Result<std::vector<api::types::v1::PackageInfoV2>> virtual searchRemote(
+      const package::FuzzyReference &fuzzyRef,
+      const api::types::v1::Repo &repo,
+      bool semanticMatching = false) const noexcept;
+    utils::error::Result<repo::RemotePackages> virtual matchRemoteByPriority(
+      const package::FuzzyReference &fuzzyRef,
+      const std::optional<api::types::v1::Repo> &repo = std::nullopt) const noexcept;
 
-    utils::error::Result<std::vector<api::types::v1::PackageInfoV2>> listLocal() const noexcept;
-    utils::error::Result<std::vector<api::types::v1::PackageInfoV2>>
-    listRemote(const package::FuzzyReference &fuzzyRef) const noexcept;
-
+    utils::error::Result<std::vector<api::types::v1::RepositoryCacheLayersItem>>
+    listLayerItem() const noexcept;
+    [[nodiscard]] virtual utils::error::Result<
+      std::vector<api::types::v1::RepositoryCacheLayersItem>>
+    listLocalBy(const linglong::repo::repoCacheQuery &query) const noexcept;
+    utils::error::Result<int64_t>
+    getLayerCreateTime(const api::types::v1::RepositoryCacheLayersItem &item) const noexcept;
     utils::error::Result<void> remove(const package::Reference &ref,
-                                      bool develop = false,
-                                      const QString &subRef = "") noexcept;
-    utils::error::Result<void> prune();
+                                      const std::string &module = "binary") noexcept;
+    utils::error::Result<void>
+    remove(const api::types::v1::RepositoryCacheLayersItem &item) noexcept;
+    utils::error::Result<void>
+    clean(const std::vector<api::types::v1::RepositoryCacheLayersItem> &reserved) noexcept;
 
-    void removeDanglingXDGIntergation() noexcept;
-    void exportReference(const package::Reference &ref) noexcept;
-    void unexportReference(const package::Reference &ref) noexcept;
+    virtual utils::error::Result<void> prune();
+
+    virtual utils::error::Result<RefMetaData>
+    fetchRefMetaData(const package::ReferenceWithRepo &refRepo,
+                     const std::string &module = "binary",
+                     bool fetchPackageInfo = false) noexcept;
+    virtual utils::error::Result<RefStatistics>
+    getRefStatistics(const RefMetaData &meta) const noexcept;
+
+    // Export desktop integration entries for all or one module of an application reference.
+    void exportAppReference(const package::Reference &ref,
+                            const std::optional<std::string> &module = std::nullopt) noexcept;
+    void exportLayerSignData(const package::Reference &ref,
+                             const std::string &module = "binary") noexcept;
+    void exportLayerSignData(const api::types::v1::RepositoryCacheLayersItem &item) noexcept;
+    // Unexport desktop integration entries for all or one module of an application reference.
+    void unexportAppReference(const package::Reference &ref,
+                              const std::optional<std::string> &module = std::nullopt) noexcept;
+    void unexportLayerSignData(const api::types::v1::RepositoryCacheLayersItem &item) noexcept;
     void updateSharedInfo() noexcept;
+    utils::error::Result<void> markDeleted(const package::Reference &ref,
+                                           bool deleted,
+                                           const std::string &module = "binary") noexcept;
+    bool isMarkedDeleted(const package::Reference &ref, const std::string &module) const noexcept;
+
+    // 扫描layers变动，重新合并变动layer的modules
+    [[nodiscard]] virtual utils::error::Result<void> mergeModules() const noexcept;
+    // 获取合并后的layerDir，如果没有找到则返回binary模块的layerDir
+    [[nodiscard]] virtual utils::error::Result<package::LayerDir>
+    getMergedModuleDir(const package::Reference &ref, bool fallbackLayerDir = true) const noexcept;
+    // 将指定的modules合并到临时目录，返回值析构时自动删除该目录
+    [[nodiscard]] virtual utils::error::Result<package::TempLayerDir> createTempMergedModuleDir(
+      const package::Reference &ref, const std::vector<std::string> &modules) const noexcept;
+    virtual std::vector<std::string> getModuleList(const package::Reference &ref) const noexcept;
+    [[nodiscard]] virtual utils::error::Result<std::vector<std::string>> getRemoteModuleList(
+      const package::Reference &ref, const api::types::v1::Repo &repo) const noexcept;
+    virtual utils::error::Result<package::ReferenceWithRepo>
+    latestRemoteReference(const package::FuzzyReference &fuzzyRef) const noexcept;
+    virtual utils::error::Result<package::Reference>
+    latestLocalReference(const package::FuzzyReference &fuzzyRef) const noexcept;
+
+    [[nodiscard]] virtual utils::error::Result<api::types::v1::RepositoryCacheLayersItem>
+    getLayerItem(const package::Reference &ref, std::string module = "binary") const noexcept;
+    utils::error::Result<void> fixExportAllEntries() noexcept;
+    [[nodiscard]] std::filesystem::path resolveEntryExportPath(
+      const std::filesystem::path &relativePath, bool preferLibSystemdUser = false) const noexcept;
+    [[nodiscard]] std::filesystem::path
+    resolveDesktopFileExportPath(const std::filesystem::path &relativePath) const noexcept;
+
+    virtual std::unique_ptr<ClientAPIWrapper> createClientV2(const std::string &url) const
+    {
+        return ClientFactory(url).createClientV2();
+    }
+
+    const api::types::v1::Repo &getDefaultRepo() const
+    {
+        return linglong::repo::getDefaultRepo(cfg);
+    }
+
+    [[nodiscard]] const std::filesystem::path &getRepoDir() const noexcept { return repoDir; }
+
+    virtual utils::error::Result<std::vector<api::types::v1::PackageInfoV2>>
+    listLocalApps() const noexcept;
+    utils::error::Result<std::vector<std::pair<package::Reference, package::ReferenceWithRepo>>>
+    upgradableApps() const noexcept;
 
 private:
-    api::types::v1::RepoConfig cfg;
+    api::types::v1::RepoConfigV2 cfg;
 
     struct OstreeRepoDeleter
     {
-        void operator()(OstreeRepo *repo)
-        {
-            qDebug() << "delete OstreeRepo" << repo;
-            g_clear_object(&repo);
-        }
+        void operator()(OstreeRepo *repo) { g_clear_object(&repo); }
     };
 
     std::unique_ptr<OstreeRepo, OstreeRepoDeleter> ostreeRepo = nullptr;
-    QDir repoDir;
-    QDir ostreeRepoDir() const noexcept;
-    QDir getLayerQDir(const package::Reference &ref, bool develop = false) const noexcept;
-    QDir getLayerQDirV2(const package::Reference &ref,
-                        bool develop = false,
-                        const QString &subRef = "") const noexcept;
+    std::filesystem::path repoDir;
+    std::unique_ptr<linglong::repo::RepoCache> cache{ nullptr };
 
-    ClientFactory &m_clientFactory;
+    std::filesystem::path ostreeRepoDir() const noexcept;
+    std::filesystem::path cacheFilePath() const noexcept;
+    std::filesystem::path configFilePath() const noexcept;
+    [[nodiscard]] utils::error::Result<QDir>
+    ensureEmptyLayerDir(const std::string &commit) const noexcept;
+    utils::error::Result<void> handleRepositoryUpdate(
+      QDir layerDir, const api::types::v1::RepositoryCacheLayersItem &layer) noexcept;
+    utils::error::Result<void> removeOstreeRef(const std::string &remote,
+                                               const std::string &ref,
+                                               const std::string &commit) noexcept;
+    utils::error::Result<void>
+    removeOstreeRef(const api::types::v1::RepositoryCacheLayersItem &layer) noexcept;
+    utils::error::Result<void> undeployedLayer(const std::string &commit) noexcept;
+    utils::error::Result<void>
+    undeployedLayer(const api::types::v1::RepositoryCacheLayersItem &layer) noexcept;
+    [[nodiscard]] std::filesystem::path layerPath(const std::string &commit) const noexcept;
+    [[nodiscard]] utils::error::Result<package::LayerDir>
+    getLayerDir(const std::string &commit) const noexcept;
+    [[nodiscard]] utils::error::Result<package::LayerDir>
+    getLayerDir(const api::types::v1::RepositoryCacheLayersItem &layer) const noexcept;
+
+    // 获取合并后的layerDir，如果没有找到则返回binary模块的layerDir
+    [[nodiscard]] utils::error::Result<package::LayerDir>
+    getMergedModuleDir(const api::types::v1::RepositoryCacheLayersItem &layer,
+                       bool fallbackLayerDir = true) const noexcept;
+    static utils::error::Result<void> IniLikeFileRewrite(const QFileInfo &info,
+                                                         const QString &id) noexcept;
+
+    // Rebuild entries exported by all locally installed layers.
+    utils::error::Result<void> exportAllEntries() noexcept;
+    utils::error::Result<std::vector<guint64>> getCommitSize(const std::string &remote,
+                                                             const std::string &refString) noexcept;
+    GVariantBuilder initOStreePullOptions(const std::string &ref) noexcept;
+
+protected:
+    OSTreeRepo(std::filesystem::path path, api::types::v1::RepoConfigV2 cfg) noexcept;
+    static std::vector<std::string> buildPullRefCandidates(const package::Reference &ref,
+                                                           const std::string &module) noexcept;
+    static bool shouldFallbackToRuntimeBranch(const std::string &module,
+                                              const GError *gErr) noexcept;
+
+    utils::error::Result<void> init(bool create) noexcept;
+    utils::error::Result<void> initCache(bool create) noexcept;
+
+    // entries目录，/var/lib/linglong/entries
+    std::filesystem::path getEntriesDir() const noexcept;
+    // 默认的shared目录，/var/lib/linglong/entries/share
+    std::filesystem::path getDefaultSharedDir() const noexcept;
+    // 能覆盖系统目录的shared目录，/var/lib/linglong/entries/apps/share
+    virtual std::filesystem::path getOverlayShareDir() const noexcept;
+    utils::error::Result<void> exportDir(const std::string &appID,
+                                         const std::filesystem::path &source,
+                                         const std::filesystem::path &rootEntriesDir,
+                                         const std::filesystem::path &relativeDestination,
+                                         const int &max_depth);
+    utils::error::Result<void> exportLayerEntries(
+      const std::filesystem::path &, const api::types::v1::RepositoryCacheLayersItem &) noexcept;
+    utils::error::Result<void> exportLayerSignData(
+      const std::filesystem::path &, const api::types::v1::RepositoryCacheLayersItem &) noexcept;
+    virtual utils::error::Result<bool> shouldExportSignData() const noexcept;
+    utils::error::Result<void> exportAppEntries(
+      const std::filesystem::path &, const api::types::v1::RepositoryCacheLayersItem &) noexcept;
+    utils::error::Result<void> unexportLayerSignData(
+      const std::filesystem::path &, const api::types::v1::RepositoryCacheLayersItem &) noexcept;
+    utils::error::Result<void> unexportAppEntries(
+      const std::filesystem::path &, const std::vector<std::filesystem::path> &) noexcept;
 };
 
 } // namespace linglong::repo
-
-#endif // LINGLONG_SRC_MODULE_REPO_OSTREE_REPO_H_

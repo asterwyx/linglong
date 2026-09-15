@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-#ifndef LINGLONG_UTILS_SERIALIZE_YAML_H
-#define LINGLONG_UTILS_SERIALIZE_YAML_H
+#pragma once
 
 // NOTE: DO NOT REMOVE THIS HEADER, nlohmann::json need this header to lookup function 'from_json'
 #include "linglong/api/types/v1/Generators.hpp"
@@ -16,10 +15,14 @@
 #include <yaml-cpp/yaml.h>
 
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 namespace linglong::utils::serialize {
 
-template<typename T, typename Source>
+template <typename T, typename Source>
 error::Result<T> LoadYAML(Source &content)
 {
     LINGLONG_TRACE("load yaml");
@@ -28,32 +31,22 @@ error::Result<T> LoadYAML(Source &content)
         nlohmann::json json = ytj::to_json(node);
         return json.template get<T>();
     } catch (...) {
-        return LINGLONG_ERR(std::current_exception());
+        auto exp = std::current_exception();
+        return LINGLONG_ERR(exp);
     }
 }
 
-template<typename T>
-error::Result<T> LoadYAMLFile(const QString &filename) noexcept
+template <typename T>
+error::Result<T> LoadYAMLFile(const std::filesystem::path &filename) noexcept
 {
     LINGLONG_TRACE("load yaml from file");
 
-    QFile file = filename;
-
-    file.open(QFile::ReadOnly);
-    if (!file.isOpen()) {
-        return LINGLONG_ERR("open", file);
+    std::ifstream file_stream(filename);
+    if (!file_stream.is_open()) {
+        return LINGLONG_ERR("Failed to open file: " + filename.string());
     }
 
-    Q_ASSERT(file.error() == QFile::NoError);
-
-    auto content = file.readAll();
-    if (file.error() != QFile::NoError) {
-        return LINGLONG_ERR("read all", file);
-    }
-
-    return LoadYAML<T>(content);
+    return LoadYAML<T>(file_stream);
 }
 
 } // namespace linglong::utils::serialize
-
-#endif

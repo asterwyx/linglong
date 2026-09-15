@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2022 UnionTech Software Technology Co., Ltd.
+ * SPDX-FileCopyrightText: 2022 - 2026 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
@@ -8,31 +8,38 @@
 
 #include "linglong/api/types/v1/Generators.hpp"
 #include "linglong/utils/error/error.h"
+#include "linglong/utils/log/log.h"
 #include "linglong/utils/serialize/yaml.h"
 #include "ytj/ytj.hpp"
+
+#include <fmt/format.h>
 
 #include <fstream>
 
 namespace linglong::repo {
 
-utils::error::Result<api::types::v1::RepoConfig> loadConfig(const QString &file) noexcept
+utils::error::Result<api::types::v1::RepoConfigV2>
+loadConfig(const std::filesystem::path &file) noexcept
 {
-    LINGLONG_TRACE(QString("load repo config from %1").arg(file));
+    LINGLONG_TRACE(fmt::format("load repo config from {}", file));
 
     try {
-        auto ifs = std::ifstream(file.toLocal8Bit());
+        auto ifs = std::ifstream(file);
         if (!ifs.is_open()) {
             return LINGLONG_ERR("open failed");
         }
 
-        auto config = utils::serialize::LoadYAML<api::types::v1::RepoConfig>(ifs);
-        if (config->version != 1) {
-            return LINGLONG_ERR(
-              QString("wrong configuration file version %1").arg(config->version));
-        }
+        // 尝试加载新版本配置
+        auto config = utils::serialize::LoadYAML<api::types::v1::RepoConfigV2>(ifs);
+        if (!config) {
+            ifs.seekg(0);
+            auto configV1 = utils::serialize::LoadYAML<api::types::v1::RepoConfig>(ifs);
+            if (!configV1) {
+                return LINGLONG_ERR("parse yaml failed");
+            }
 
-        if (config->repos.find(config->defaultRepo) == config->repos.end()) {
-            return LINGLONG_ERR(QString("default repo not found in repos"));
+            // 将旧版本配置转换为新版本
+            config = convertToV2(*configV1);
         }
 
         return config;
@@ -41,46 +48,149 @@ utils::error::Result<api::types::v1::RepoConfig> loadConfig(const QString &file)
     }
 }
 
-utils::error::Result<api::types::v1::RepoConfig> loadConfig(const QStringList &files) noexcept
+utils::error::Result<api::types::v1::RepoConfigV2>
+loadConfig(const std::vector<std::filesystem::path> &files) noexcept
 {
-    LINGLONG_TRACE(QString("load repo config from %1").arg(files.join(" ")));
+    LINGLONG_TRACE("load repo config");
 
     for (const auto &file : files) {
         auto config = loadConfig(file);
         if (!config.has_value()) {
-            qDebug() << "Failed to load repo config from" << file << ":" << config.error();
+            LogD("Failed to load repo config from {}: {}", file, config.error());
             continue;
         }
 
-        qDebug() << "load repo config from" << file;
+        LogD("load repo config from {}", file);
         return config;
     }
 
     return LINGLONG_ERR("all failed");
 }
 
-utils::error::Result<void> saveConfig(const api::types::v1::RepoConfig &cfg,
-                                      const QString &path) noexcept
+utils::error::Result<void> saveConfig(const api::types::v1::RepoConfigV2 &cfg,
+                                      const std::filesystem::path &path) noexcept
 {
-    LINGLONG_TRACE(QString("save config to %1").arg(path));
+    LINGLONG_TRACE(fmt::format("save config to {}", path));
 
     try {
-        if (cfg.repos.find(cfg.defaultRepo) == cfg.repos.end()) {
+        auto defaultRepoExists =
+          std::any_of(cfg.repos.begin(), cfg.repos.end(), [&cfg](const auto &repo) {
+              return repo.alias.value_or(repo.name) == cfg.defaultRepo;
+          });
+
+        if (!defaultRepoExists) {
             return LINGLONG_ERR("default repo not found in repos");
         }
 
-        auto ofs = std::ofstream(path.toLocal8Bit());
+        auto ofs = std::ofstream(path);
         if (!ofs.is_open()) {
             return LINGLONG_ERR("open failed");
         }
 
         auto node = ytj::to_yaml(cfg);
         ofs << node;
+        ofs.close();
+        if (!ofs) {
+            return LINGLONG_ERR("write failed");
+        }
 
         return LINGLONG_OK;
     } catch (const std::exception &e) {
         return LINGLONG_ERR(e);
     }
+}
+
+const api::types::v1::Repo &getDefaultRepo(const api::types::v1::RepoConfigV2 &cfg) noexcept
+{
+    const auto &defaultRepo =
+      std::find_if(cfg.repos.begin(), cfg.repos.end(), [&cfg](const auto &repo) {
+          return repo.alias.value_or(repo.name) == cfg.defaultRepo;
+      });
+
+    return *defaultRepo;
+}
+
+std::vector<api::types::v1::Repo> getPrioritySortedRepos(api::types::v1::RepoConfigV2 cfg) noexcept
+{
+    std::stable_sort(cfg.repos.begin(), cfg.repos.end(), [](const auto &repo1, const auto &repo2) {
+        return repo1.priority > repo2.priority;
+    });
+    return cfg.repos;
+}
+
+std::vector<std::vector<api::types::v1::Repo>>
+getPriorityGroupedRepos(api::types::v1::RepoConfigV2 cfg) noexcept
+{
+    auto sortedRepos = getPrioritySortedRepos(std::move(cfg));
+    if (sortedRepos.empty()) {
+        return {};
+    }
+
+    std::vector<std::vector<api::types::v1::Repo>> groupedRepos;
+    for (const auto &repo : sortedRepos) {
+        if (groupedRepos.empty() || groupedRepos.back().front().priority != repo.priority) {
+            groupedRepos.emplace_back();
+        }
+        groupedRepos.back().emplace_back(repo);
+    }
+    return groupedRepos;
+}
+
+api::types::v1::RepoConfigV2 convertToV2(const api::types::v1::RepoConfig &cfg) noexcept
+{
+    api::types::v1::RepoConfigV2 configV2;
+    configV2.version = 2;
+    configV2.defaultRepo = cfg.defaultRepo;
+    int64_t priority = 0;
+
+    const auto &defaultRepo =
+      std::find_if(cfg.repos.begin(), cfg.repos.end(), [&cfg](const auto &repo) {
+          return repo.first == cfg.defaultRepo;
+      });
+
+    api::types::v1::Repo repoV2{
+        .name = defaultRepo->first,
+        .priority = priority,
+        .url = defaultRepo->second,
+    };
+
+    configV2.repos.emplace_back(std::move(repoV2));
+    priority -= 100;
+
+    for (const auto &[name, url] : cfg.repos) {
+        if (name == cfg.defaultRepo) {
+            continue;
+        }
+
+        api::types::v1::Repo repoV2{ .name = name, .priority = priority, .url = url };
+        configV2.repos.emplace_back(std::move(repoV2));
+        priority -= 100;
+    }
+
+    return configV2;
+}
+
+int64_t getRepoMinPriority(const api::types::v1::RepoConfigV2 &cfg) noexcept
+{
+
+    auto minElement = std::min_element(cfg.repos.begin(),
+                                       cfg.repos.end(),
+                                       [](const auto &repo1, const auto &repo2) {
+                                           return repo1.priority < repo2.priority;
+                                       });
+
+    return minElement->priority;
+}
+
+int64_t getRepoMaxPriority(const api::types::v1::RepoConfigV2 &cfg) noexcept
+{
+    auto maxElement = std::max_element(cfg.repos.begin(),
+                                       cfg.repos.end(),
+                                       [](const auto &repo1, const auto &repo2) {
+                                           return repo1.priority < repo2.priority;
+                                       });
+
+    return maxElement->priority;
 }
 
 } // namespace linglong::repo
